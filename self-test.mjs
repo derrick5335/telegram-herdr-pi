@@ -396,6 +396,25 @@ async function selfTest() {
       assert.deepEqual(order.slice(3), ["queued", ...ordinary], "only abort and restart bypass the update chain");
     }
 
+    activeTest = "A phone-created topic waits for a workspace pick from projectsDir.";
+    {
+      const { gw, calls } = await fresh();
+      gw.config.projectsDir = await mkdtemp(join(dir, "projects-"));
+      for (const name of ["b", "a", ".hidden"]) await mkdir(join(gw.config.projectsDir, name));
+      const seen = [];
+      gw.handleUpdate = async (u, session) => { seen.push([u.message.text, session.cwd]); };
+      const queued = gw.dispatchUpdate({ message: message("hi", { message_thread_id: 77 }) });
+      await until(() => calls.some((c) => c.body.reply_markup));
+      const rows = calls.find((c) => c.body.reply_markup).body.reply_markup.inline_keyboard;
+      assert.deepEqual(rows.map(([b]) => b.text), ["a", "b"]);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(seen.length, 0, "messages wait for the pick");
+      await gw.dispatchUpdate({ callback_query: { id: "cb", from: { id: 1 }, message: { chat: { id: 1, type: "private" }, message_id: 1, message_thread_id: 77 }, data: rows[1][0].callback_data } });
+      await queued;
+      assert.deepEqual(seen, [["hi", join(gw.config.projectsDir, "b")]]);
+      assert.equal(gw.state.topics[77].cwd, join(gw.config.projectsDir, "b"));
+    }
+
     for (const [owned, deleteTopic] of [[true, false], [false, false], [true, true]]) {
       const { gw, calls } = await fresh();
       const s = await gw.createTopic({ threadId: 99, cwd: dir, name: "deleted", binding: { owned, paneId: "gone" } });

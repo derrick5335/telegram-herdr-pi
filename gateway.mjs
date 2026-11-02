@@ -3,7 +3,7 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, openAsBlob, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
@@ -252,6 +252,7 @@ function loadConfig() {
     presenceFile: file.presenceFile ? resolvePath(file.presenceFile, configDir) : "",
     logFile: resolvePath(process.env.REMOTE_PI_LOG_FILE || file.logFile || join(homedir(), ".local", "var", "log", "remote-pi.log"), configDir),
     sttCommand: file.sttCommand || "",
+    projectsDir: resolvePath(file.projectsDir || "~/dev", configDir),
   };
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(config.botToken || "")) throw new Error(`Invalid telegram.botToken in ${path}`);
   if (!/^\d+$/.test(config.allowedUserId)) throw new Error(`Invalid telegram.allowedUserId in ${path}`);
@@ -1100,7 +1101,17 @@ class Gateway {
     if (this.sessions.has(key)) return this.sessions.get(key);
     const session = new ChatSession(this, { threadId: Number(key.slice(2)), cwd: this.mainSession.cwd });
     this.sessions.set(key, session);
-    void this.persistPaneSession(session).then(() => session.send(`Topic session started with workspace:\n${session.cwd}\n\nUse /topic <path> for another project.`))
+    let dirs = [];
+    try {
+      dirs = readdirSync(this.config.projectsDir, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith("."))
+        .map((d) => join(this.config.projectsDir, d.name)).sort();
+    } catch {}
+    // Hold the topic's messages until a workspace is picked, so Pi never starts in the wrong folder.
+    if (dirs.length) ({ promise: session.updateChain, resolve: session.pickCwd } = Promise.withResolvers());
+    const welcome = dirs.length ? () => session.send("Choose a workspace for this topic (messages wait until you pick):",
+      session.keyboard(dirs.map((cwd) => ({ label: basename(cwd), action: { type: "pick_cwd", cwd } })), 7 * 86_400_000))
+      : () => session.send(`Topic session started with workspace:\n${session.cwd}\n\nUse /topic <path> for another project.`);
+    void this.persistPaneSession(session).then(welcome)
       .catch((error) => log("topic", `Failed to initialize ${key}: ${error.message}`));
     return session;
   }
@@ -1187,6 +1198,7 @@ class Gateway {
       this.telegram.react(this.chatId, m.message_id, "👀");
       return session.handleCommand(command, update.update_id);
     }
+    if (action?.type === "pick_cwd") return this.handleCallback(callback, session); // the update chain waits for this pick
     // ref: https://docs.python-telegram-bot.org/en/stable/telegram.message.html#telegram.Message.media_group_id — serialize albums at the first message.
     if (m?.media_group_id) {
       this.telegram.react(this.chatId, m.message_id, "👀");
@@ -1405,6 +1417,15 @@ class Gateway {
     try {
       log("callback", `handling ${action.type}`);
       switch (action.type) {
+        case "pick_cwd": {
+          if (!session.pickCwd) return;
+          session.cwd = action.cwd;
+          session.pickCwd();
+          session.pickCwd = null;
+          await this.persistPaneSession(session);
+          if (callback?.message) await this.telegram.edit(callback.message.chat.id, callback.message.message_id, `📁 Workspace: ${action.cwd}`).catch(() => {});
+          return;
+        }
         case "jump_pane": {
           const connection = this.bridge.connections.get(action.paneId);
           if (!connection) return session.send("That Pi is not connected. Enable /remote-control in its pane first.");

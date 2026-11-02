@@ -115,6 +115,7 @@ Herdr 服务端未运行但 Herdr 桌面版在运行时，从 Telegram 启动的
 - 主聊天里的文字驱动主会话（收到第一条消息时，才在新的 Herdr workspace 里启动）。
 - Pi 工作时发送的消息会调整当前这一轮；`/followup` 则把消息排到这一轮之后。
 - `/topic [path]` 为某个项目在独立的 Topic 和 Herdr workspace 里再启动一个 Pi；`/close` 会退出它并关闭窗格。
+- 在 Telegram 客户端里新建的 Topic 会先让你从 `projectsDir`（默认 `~/dev`）下的文件夹中选择工作区；选好之前消息会排队等待。
 - `/new` 在**同一个 Pi** 里开始新会话（同一个窗格，终端也会同步切换）；`/resume` 列出这个 workspace 的历史会话，并且绝不会去打开一个已经在别处运行的会话。
 
 ### 命令
@@ -158,6 +159,7 @@ Herdr 服务端未运行但 Herdr 桌面版在运行时，从 Telegram 启动的
   "telegram": { "botToken": "123456789:ABC…", "allowedUserId": "123456789" },
   "cwd": "~/dev/my-project",
   "sttCommand": "",
+  "projectsDir": "~/dev",
   "presenceFile": "~/.local/var/remote-pi/present"
 }
 ```
@@ -168,6 +170,7 @@ Herdr 服务端未运行但 Herdr 桌面版在运行时，从 Telegram 启动的
 | `telegram.allowedUserId` | 必填 | bot 唯一会响应的 Telegram 用户 |
 | `cwd` | 首次运行必填 | 主会话的 workspace（支持 `~/`） |
 | `sttCommand` | `""` | 语音转写命令；音频路径作为 `$1` 传入，命令输出转写后的文字 |
+| `projectsDir` | `"~/dev"` | 在 Telegram 客户端里新建 Topic 时，列为工作区按钮的文件夹所在目录 |
 | `presenceFile` | `""` | 这个文件存在期间，一律不响铃 |
 | `stateDir` | `~/.local/var/remote-pi` | 网关状态、下载文件（保留 30 天）、实例锁和 `bridge.sock` |
 | `logFile` | `~/.local/var/log/remote-pi.log` | 日志文件（也可用 `REMOTE_PI_LOG_FILE` 指定）；只记录不含内容的元数据 |

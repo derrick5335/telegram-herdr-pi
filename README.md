@@ -115,6 +115,7 @@ When the Herdr server is not running but the Herdr desktop app is, Telegram-star
 - Text in the main chat drives the main session (started lazily in a new Herdr workspace on the first message).
 - Messages sent while Pi is working steer the current turn; `/followup` queues one for afterwards.
 - `/topic [path]` starts another Pi for a project in its own topic and Herdr workspace; `/close` quits it and closes its pane.
+- A topic you create in the Telegram app first asks which folder under `projectsDir` (default `~/dev`) to work in; messages wait until you pick.
 - `/new` starts a fresh session **in the same Pi** (same pane, the terminal switches too); `/resume` lists past sessions of the workspace and never opens a session that is already running elsewhere.
 
 ### Commands
@@ -158,6 +159,7 @@ Any other `/command` is routed to Pi's native command of the same name (Telegram
   "telegram": { "botToken": "123456789:ABC…", "allowedUserId": "123456789" },
   "cwd": "~/dev/my-project",
   "sttCommand": "",
+  "projectsDir": "~/dev",
   "presenceFile": "~/.local/var/remote-pi/present"
 }
 ```
@@ -168,6 +170,7 @@ Any other `/command` is routed to Pi's native command of the same name (Telegram
 | `telegram.allowedUserId` | required | The only Telegram user the bot answers |
 | `cwd` | required on first run | Workspace of the main session (`~/` allowed) |
 | `sttCommand` | `""` | Voice transcription command; receives the audio path as `$1`, prints the text |
+| `projectsDir` | `"~/dev"` | Folders listed as workspace buttons when you create a topic in the Telegram app |
 | `presenceFile` | `""` | While this file exists, nothing rings |
 | `stateDir` | `~/.local/var/remote-pi` | Gateway state, downloads (kept 30 days), lock and `bridge.sock` |
 | `logFile` | `~/.local/var/log/remote-pi.log` | Log file (also `REMOTE_PI_LOG_FILE`); content-free metadata only |

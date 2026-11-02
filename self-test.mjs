@@ -492,7 +492,7 @@ async function selfTest() {
       }
     }
     assert.equal(paneHasForegroundShell({ shell_pid: 0, foreground_process_group_id: 0 }), false);
-    activeTest = "Herdr desktop fallback: hc tab in the Telegram space, reconnect grace, label-gated replace and close.";
+    activeTest = "Herdr desktop fallback: hc tab in its repo's space, reconnect grace, label-gated replace and close.";
     for (const mode of ["new", "stale"]) {
       const { gw, s } = await fresh(), calls = [];
       Object.assign(gw, { herdrSocketPath: "/fake/socket", chatReady: true, me: { has_topics_enabled: true } });
@@ -510,16 +510,25 @@ async function selfTest() {
         assert.ok(predicate(c));
         return c;
       };
-      gw.desktop = async (command, ...args) => {
+      const repo = join(dir, "repo");
+      gw.cli = async (command, ...args) => {
+        if (command === "git") return args[1] === join(repo, "sub") || args[1] === repo ? `${repo}\n` : Promise.reject(new Error("not a repo"));
+        if (command === "herdr-app") return JSON.stringify({ spaces: [{ id: "sp0", machine: "vps", tabs: [{ terminals: [{ terminal: "t1" }] }] },
+          { id: "sp1", machine: null, tabs: [{ terminals: [{ terminal: "t2" }] }] }, { id: "sp2", machine: null, tabs: [{ terminals: [{ terminal: "t3" }] }] }] });
+        if (args[0] === "get" && ["t2", "t3"].includes(args[1])) return JSON.stringify({ cwd: dir, foreground: { cwd: args[1] === "t3" ? join(repo, "sub") : dir } });
         calls.push([command, ...args]);
-        if (args[0] === "ls") return JSON.stringify({ spaces: [{ id: "sp0", name: "Telegram", machine: "vps" }, { id: "sp1", name: "Telegram", machine: null }] });
         if (args[0] === "run") return JSON.stringify({ address: "t5" });
         return JSON.stringify(args[0] === "get" ? { state: "live", labels: { remote_pi: "on" } } : {});
       };
+      s.cwd = mode === "new" ? repo : join(dir, "other");
       assert.equal(await gw.startPaneSession(s.pi), true);
       const stale = mode === "stale" ? [["hc", "get", "t4"], ["hc", "kill", "t4"], ["hc", "rm", "t4"]] : [];
-      assert.deepEqual(calls.splice(0), [...stale, ["herdr-app", "ls"], ["hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", s.cwd,
-        "--label", "remote_pi=on", "--label", "herdr.space=sp1", "--", "pi"]]);
+      const run = calls.splice(0);
+      // Same repo (even from a subfolder) joins that space; an unmatched folder gets a fresh id, i.e. a new auto-named space.
+      assert.deepEqual(run.slice(0, -1), stale);
+      assert.deepEqual(run.at(-1).slice(0, -4), ["hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", s.cwd, "--label", "remote_pi=on"]);
+      if (mode === "new") assert.equal(run.at(-1).at(-3), "herdr.space=sp2");
+      else assert.match(run.at(-1).at(-3), /^herdr\.space=sp[0-9a-f]{32}$/);
       assert.deepEqual([s.binding.paneId, s.binding.terminalId, s.binding.owned], ["hc:t5", "scope-5", true]);
       s.pi.proc = {};
       s.pi.request = async (type) => { calls.push(type); };

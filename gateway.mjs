@@ -1003,17 +1003,17 @@ class Gateway {
     try { pane = (await this.herdr("pane.get", { pane_id: binding.paneId }))?.pane; } catch {}
     return pane?.terminal_id === binding.terminalId ? pane : null;
   }
-  // Herdr desktop (herdr-core) when the Herdr server is down: Pi opens as a tab in the "Telegram" space, and the
+  // Herdr desktop (herdr-core) when the Herdr server is down: Pi opens as a new tab in its project's space, and the
   // remote_pi=on label tells the extension to attach at startup. ref: `hc --skill`, `herdr-app --skill` (herdr.space labels).
   async startHcPane(session, file) {
-    let space = null, address;
+    const space = await this.hcSpace(session.cwd).catch((error) => {
+      log("herdr", `cannot match a Herdr space: ${error.message}`);
+      return null;
+    });
+    let address;
     try {
-      space = JSON.parse(await this.desktop("herdr-app", "ls")).spaces.find((s) => s.name === "Telegram" && !s.machine)?.id ||
-        JSON.parse(await this.desktop("herdr-app", "do", "space.new", "--name", "Telegram", "--folder", session.cwd)).space;
-    } catch (error) { log("herdr", `Herdr window unavailable; Pi starts hidden: ${error.message}`); }
-    try {
-      ({ address } = JSON.parse(await this.desktop("hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", session.cwd,
-        "--label", "remote_pi=on", ...(space ? ["--label", `herdr.space=${space}`] : []), "--", "pi", ...(file ? ["--session", file] : []))));
+      ({ address } = JSON.parse(await this.cli("hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", session.cwd,
+        "--label", "remote_pi=on", "--label", `herdr.space=${space || `sp${randomBytes(16).toString("hex")}`}`, "--", "pi", ...(file ? ["--session", file] : []))));
     } catch (error) {
       log("herdr", `hc run failed: ${error.message}`);
       throw new Error("Herdr is required: open Herdr desktop or start the herdr server");
@@ -1025,15 +1025,28 @@ class Gateway {
     session.binding.terminalId = connection.hello.terminalId;
     return connection;
   }
+  // Herdr names an unnamed space after its first terminal's live repo (else folder); reuse the space whose first terminal
+  // is in the same repo. An unknown herdr.space id makes Herdr create a new, auto-named space.
+  // ref: ~/.config/herdr-app/AGENTS.md "The model: spaces, tabs, terminals".
+  async hcSpace(cwd) {
+    const repo = (dir) => this.cli("git", "-C", dir, "rev-parse", "--show-toplevel").then((out) => out.trim(), () => dir);
+    const target = await repo(cwd);
+    for (const space of JSON.parse(await this.cli("herdr-app", "ls")).spaces) {
+      const first = space.tabs[0]?.terminals[0]?.terminal;
+      const terminal = !space.machine && first && await this.cli("hc", "get", first).then(JSON.parse, () => null);
+      if (terminal && await repo(terminal.foreground?.cwd || terminal.cwd) === target) return space.id;
+    }
+    return null;
+  }
   // The label guards against acting on a terminal that is no longer ours (address reuse or /remote-control off).
   async hcOwnedTerminal(paneId) {
-    const terminal = await this.desktop("hc", "get", paneId.slice(3)).then(JSON.parse).catch(() => null);
+    const terminal = await this.cli("hc", "get", paneId.slice(3)).then(JSON.parse).catch(() => null);
     return terminal?.state === "live" && terminal.labels?.remote_pi === "on";
   }
   async closeHcTerminal(paneId) {
-    for (const command of ["kill", "rm"]) await this.desktop("hc", command, paneId.slice(3)).catch(() => {});
+    for (const command of ["kill", "rm"]) await this.cli("hc", command, paneId.slice(3)).catch(() => {});
   }
-  async desktop(command, ...args) {
+  async cli(command, ...args) {
     if (HERDR_DISABLED_FOR_TEST) throw new Error(`Self-test must never call ${command}: ${args[0]}`);
     return execFileAsync(command, args, { timeout: 10_000, killSignal: "SIGKILL" }).then((r) => r.stdout);
   }
@@ -1318,7 +1331,7 @@ class Gateway {
       if (!session.isStreaming || session.uiMessages?.size) continue;
       const connection = session.pi.connection;
       screen ??= isHerdrPane(paneId) ? (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text ?? ""
-        : await this.desktop("hc", "read", paneId.slice(3));
+        : await this.cli("hc", "read", paneId.slice(3));
       if (this.blockedStatuses.get(paneId) !== "blocked" || session.pi.connection !== connection || !session.pi.proc ||
         session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
       const group = randomBytes(6).toString("hex");
@@ -1442,9 +1455,9 @@ class Gateway {
           this.dropActions((value) => value.group === action.group);
           const target = this.sessions.get(action.sessionKey);
           const hcAddress = isHerdrPane(action.paneId) ? null : action.paneId.slice(3);
-          const status = hcAddress ? JSON.parse(await this.desktop("hc", "get", hcAddress)).status?.state : (await this.herdr("agent.get", { target: action.paneId }))?.agent?.agent_status;
+          const status = hcAddress ? JSON.parse(await this.cli("hc", "get", hcAddress)).status?.state : (await this.herdr("agent.get", { target: action.paneId }))?.agent?.agent_status;
           if (target?.pi.proc && target.binding.paneId === action.paneId && target.pi.connection?.hello.paneId === action.paneId && !target.uiMessages?.size && status === "blocked") {
-            await (hcAddress ? this.desktop("hc", "keys", hcAddress, action.key) : this.herdr("agent.send_keys", { target: action.paneId, keys: [action.key] }));
+            await (hcAddress ? this.cli("hc", "keys", hcAddress, action.key) : this.herdr("agent.send_keys", { target: action.paneId, keys: [action.key] }));
           } else await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
           if (callback?.message) await this.telegram.clearKeyboard(callback.message.chat.id, callback.message.message_id);
           return;

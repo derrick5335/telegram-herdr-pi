@@ -8,7 +8,7 @@ import { Duplex } from "node:stream";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { createRemoteBridge } from "./remote-pi.ts";
+import { createRemoteBridge, detectHost } from "./remote-pi.ts";
 import {
   BOT_COMMANDS, ChatSession, Gateway, HELP, MAX_MESSAGE, PaneRpc, Telegram,
   chunks, expandableBlockquote, formatAssistantError, loadConfig, loadState, paneHasForegroundShell, parseCommand,
@@ -26,6 +26,11 @@ const until = async (predicate) => {
 const message = (text, extra = {}) => ({ message_id: 42, text, from: { id: 1 }, chat: { type: "private" }, ...extra });
 
 async function selfTestPaneBridge() {
+  const herdrTui = { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_SOCKET_PATH: "/s" };
+  assert.deepEqual(detectHost({ ...herdrTui, HC_TERMINAL_ID: "t4" }), { kind: "herdr", paneId: "w1:p1" }, "Herdr TUI keeps full integration");
+  assert.deepEqual(detectHost({ HC_TERMINAL_ID: "t4", HC_SCOPE: "s1" }), { kind: "herdr-app", paneId: "hc:t4", terminalId: "s1" });
+  assert.deepEqual(detectHost({ REX_SESSION: "session:a", REX_BLOCK: "block:b" }), { kind: "rex", paneId: "rex:block:b", terminalId: "block:b" });
+  assert.equal(detectHost({ HERDR_ENV: "1" }), null);
   const dir = await mkdtemp(join(tmpdir(), "rp-"));
   const path = join(dir, "bridge.sock");
   const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir };

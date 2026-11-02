@@ -71,6 +71,18 @@ export function herdrRequest(env: Record<string, string | undefined>, method: st
     }, false);
   });
 }
+// ref: pi-dev skill env table; Herdr TUI, Herdr desktop (herdr-core `hc`) and Rex each export the pane identity.
+// Herdr TUI wins when its full pane triple is present: only it offers pane metadata, agent.start and blocked events.
+// Other hosts prefix the pane ID so the gateway never sends it to the Herdr socket; HC_SCOPE is unique per hc terminal.
+export function detectHost(env: Record<string, string | undefined>) {
+  if (env.HERDR_ENV === "1" && env.HERDR_PANE_ID && env.HERDR_SOCKET_PATH) return { kind: "herdr", paneId: env.HERDR_PANE_ID };
+  if (env.HC_TERMINAL_ID) return { kind: "herdr-app", paneId: `hc:${env.HC_TERMINAL_ID}`, terminalId: env.HC_SCOPE || env.HC_TERMINAL_ID };
+  if (env.REX_SESSION && env.REX_BLOCK) return { kind: "rex", paneId: `rex:${env.REX_BLOCK}`, terminalId: env.REX_BLOCK };
+  return null;
+}
+// Without Herdr pane metadata, the on/off switch lives in the Pi process, so it survives /reload and session replacement.
+const REMOTE_ON = Symbol.for("remote-pi.enabled");
+const processState = globalThis as { [REMOTE_ON]?: boolean };
 export const textOf = (content: string | { type: string; text?: string }[]) =>
   typeof content === "string" ? content : (content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
 export const reconnectDelayMs = (attempt: number) => Math.min(10_000, 250 * 2 ** Math.min(attempt, 6));
@@ -93,7 +105,8 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
   let ctx: ExtensionContext, socket: net.Socket | null = null, retryTimer: ReturnType<typeof setTimeout> | null = null;
   let path: string, terminalId: string | undefined, retries = 0, connectedAt = 0, enabled = false, disposed = false, startEvent: Partial<SessionStartEvent> = {};
   const dialogs = new Map<string, { finish: (value?: string, error?: unknown) => void; request: { options: string[] } & Record<string, unknown> }>();
-  const replacements = new Map<string, Record<string, any>>(), paneId = env.HERDR_PANE_ID;
+  const host = detectHost(env), paneId = host?.paneId, herdr = host?.kind === "herdr";
+  const replacements = new Map<string, Record<string, any>>();
   const send = (message: unknown) => message !== null && writeJsonLine(socket, message);
   const on = <K extends ExtensionEvent["type"]>(type: K, handler: (event: Extract<ExtensionEvent, { type: K }>) => unknown) => {
     const register = pi.on as (type: K, handler: (event: Extract<ExtensionEvent, { type: K }>, ctx: ExtensionContext) => unknown) => unknown;
@@ -104,10 +117,10 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
   };
   const response = (request: any, data?: any, error?: any) => send({ id: request.id, type: "response", command: request.type, success: !error, ...(error ? { error: error.message || String(error) } : { data }) });
   const setTools = (on: boolean) => pi.setActiveTools([...pi.getActiveTools().filter((name) => !TOOLS.includes(name)), ...(on ? TOOLS : [])]);
-  const setOn = (on: boolean) => metadata(env, "pane.report_metadata", {
+  const setOn = async (on: boolean) => herdr ? metadata(env, "pane.report_metadata", {
     pane_id: paneId!, source: "remote-pi",
     tokens: { remote_pi: on ? "on" : null, remote_pi_session: on ? ctx?.sessionManager.getSessionFile() : null },
-  });
+  }) : processState[REMOTE_ON] = on;
   // ref: Claude Code Remote Control shows persistent active indicator (https://code.claude.com/docs/en/remote-control)
   const setStatus = (text?: string) => {
     try { if (ctx?.hasUI || ctx?.mode === "tui") ctx.ui?.setStatus?.("remote-pi", text); } catch {}
@@ -160,6 +173,9 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     });
     current.on("error", () => {});
     current.on("close", () => {
+      // Reset backoff only for a connection that stayed up; a gateway that drops us right after hello must not cause a 250ms reconnect loop.
+      if (connectedAt && Date.now() - connectedAt > 10_000) retries = 0;
+      connectedAt = 0;
       if (socket === current) disconnect(true);
     });
     readJsonLines(current, (message) => {
@@ -173,12 +189,9 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
         if (!INTERNAL_COMMANDS[message.type] && !["quit", "remote_off"].includes(message.type)) response(message, data);
       }).catch((error) => response(message, null, error));
     });
-      // Reset backoff only for a connection that stayed up; a gateway that drops us right after hello must not cause a 250ms reconnect loop.
-      if (connectedAt && Date.now() - connectedAt > 10_000) retries = 0;
-      connectedAt = 0;
   };
   const setEnabled = async (on: boolean, pane?: any) => {
-    if (on) terminalId = (pane || await metadata(env, "pane.get", { pane_id: paneId! }))?.pane?.terminal_id;
+    if (on) terminalId = herdr ? (pane || await metadata(env, "pane.get", { pane_id: paneId! }))?.pane?.terminal_id : host?.terminalId;
     enabled = on;
     await setOn(on);
     setStatus(on ? "📱 reconnecting…" : undefined);
@@ -293,7 +306,7 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     description: "Attach this Pi to Telegram (on | off | status; no argument toggles)",
     handler: async (argument, currentCtx) => {
       ctx = currentCtx;
-      if (env.HERDR_ENV !== "1" || !paneId || !env.HERDR_SOCKET_PATH) return ctx.ui.notify("/remote-control only works inside a Herdr pane.", "error");
+      if (!host) return ctx.ui.notify("/remote-control only works inside a Herdr, Herdr desktop or Rex pane.", "error");
       const arg = argument.trim().toLowerCase();
       if (arg && !["on", "off", "status"].includes(arg)) return ctx.ui.notify("Usage: /remote-control [on|off|status]", "error");
       if (arg === "status") return ctx.ui.notify(`Remote control: ${enabled ? socket?.readyState === "open" ? "connected (📱 remote)" : "reconnecting (📱 reconnecting…)" : "off"}`, "info");
@@ -349,9 +362,9 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
   on("session_start", async (event) => {
     startEvent = event;
     setTools(false);
-    if (env.HERDR_ENV !== "1" || !env.HERDR_SOCKET_PATH || !paneId) return;
-    const pane = await metadata(env, "pane.get", { pane_id: paneId }).catch(() => null);
-    enabled = pane?.pane?.tokens?.remote_pi === "on";
+    if (!host) return;
+    const pane = herdr ? await metadata(env, "pane.get", { pane_id: paneId! }).catch(() => null) : undefined;
+    enabled = herdr ? pane?.pane?.tokens?.remote_pi === "on" : processState[REMOTE_ON] === true;
     if (enabled) await setEnabled(true, pane); else setStatus(undefined);
   });
   pi.on("session_shutdown", async (event) => {
@@ -364,7 +377,7 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
   for (const type of ["agent_start", "agent_settled", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_end", "session_info_changed"] as const) on(type, (event) => send(wireEvent(event)));
   on("input", (event) => { if (event.source === "interactive") send({ type: "remote_user_input", text: event.text }); });
   on("session_before_switch", async (event) => {
-    if (!enabled || event.reason !== "resume" || !event.targetSessionFile || !env.HERDR_SOCKET_PATH) return;
+    if (!enabled || event.reason !== "resume" || !event.targetSessionFile || !herdr) return;
     // ref: Herdr agent.list exposes the native agent_session path; refuse another writer even from the desktop picker.
     let result: any;
     try { result = await metadata(env, "agent.list", {}); } catch {

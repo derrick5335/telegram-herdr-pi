@@ -397,6 +397,8 @@ class Telegram {
   }
 }
 
+// Panes from Herdr desktop (hc:) and Rex (rex:) are bridge-only; the Herdr socket API cannot address them.
+const isHerdrPane = (paneId) => Boolean(paneId) && !/^(hc|rex):/.test(paneId);
 const paneHasForegroundShell = (info) => Number.isInteger(info?.shell_pid) && info.shell_pid > 0 && info.foreground_process_group_id === info.shell_pid;
 
 // ref: Pi docs/rpc.md#framing; Node net IPC sockets. The directory is private and the socket is mode 0600.
@@ -954,6 +956,8 @@ class Gateway {
     }
     if (!connection) {
       if (!spawn) return false;
+      // A disconnected Pi in another host may still be running; starting a Herdr copy would add a second writer.
+      if (session.binding.paneId && !isHerdrPane(session.binding.paneId)) throw new Error(`Pi in ${session.binding.paneId} is not connected; run /remote-control on there`);
       if (!this.herdrSocketPath) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
       let pane = await this.ownedPane(session.binding), created = false;
       if (!pane?.pane_id) {
@@ -1281,7 +1285,7 @@ class Gateway {
   }
   syncBlockedSubscription(connect = net.createConnection) {
     if (this.stopping || HERDR_DISABLED_FOR_TEST && connect === net.createConnection || !this.herdrSocketPath) return;
-    const panes = [...new Set([...this.sessions.values()].filter((s) => s.pi.proc && s.binding.paneId).map((s) => s.binding.paneId))].sort();
+    const panes = [...new Set([...this.sessions.values()].filter((s) => s.pi.proc && isHerdrPane(s.binding.paneId)).map((s) => s.binding.paneId))].sort();
     const key = JSON.stringify(panes);
     if (key === this.subscribedPanesKey && this.herdrSubSocket && !this.herdrSubSocket.destroyed) return;
     this.subscribedPanesKey = key;

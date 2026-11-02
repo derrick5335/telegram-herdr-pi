@@ -91,7 +91,7 @@ type BridgeOptions = {
 export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}) {
   const { env = process.env, metadata = herdrRequest, connect = net.createConnection, listSessions = listPiSessions } = options;
   let ctx: ExtensionContext, socket: net.Socket | null = null, retryTimer: ReturnType<typeof setTimeout> | null = null;
-  let path: string, terminalId: string | undefined, retries = 0, enabled = false, disposed = false, startEvent: Partial<SessionStartEvent> = {};
+  let path: string, terminalId: string | undefined, retries = 0, connectedAt = 0, enabled = false, disposed = false, startEvent: Partial<SessionStartEvent> = {};
   const dialogs = new Map<string, { finish: (value?: string, error?: unknown) => void; request: { options: string[] } & Record<string, unknown> }>();
   const replacements = new Map<string, Record<string, any>>(), paneId = env.HERDR_PANE_ID;
   const send = (message: unknown) => message !== null && writeJsonLine(socket, message);
@@ -152,7 +152,7 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     socket = current;
     current.on("connect", () => {
       if (socket !== current || disposed || !enabled) return current.destroy();
-      retries = 0;
+      connectedAt = Date.now();
       setTools(true);
       hello();
       for (const dialog of dialogs.values()) send(dialog.request);
@@ -173,6 +173,9 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
         if (!INTERNAL_COMMANDS[message.type] && !["quit", "remote_off"].includes(message.type)) response(message, data);
       }).catch((error) => response(message, null, error));
     });
+      // Reset backoff only for a connection that stayed up; a gateway that drops us right after hello must not cause a 250ms reconnect loop.
+      if (connectedAt && Date.now() - connectedAt > 10_000) retries = 0;
+      connectedAt = 0;
   };
   const setEnabled = async (on: boolean, pane?: any) => {
     if (on) terminalId = (pane || await metadata(env, "pane.get", { pane_id: paneId! }))?.pane?.terminal_id;

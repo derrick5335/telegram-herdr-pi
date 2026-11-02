@@ -380,9 +380,13 @@ class Telegram {
         if (!this.polling) break;
         const conflict = error.message?.includes("Conflict");
         if (conflict && !this.inConflict) log("tg:poll", `conflict: ${error.message}`);
-        if (!conflict && ++this.pollFailures === 1) {
-          this.outageStart = Date.now();
-          log("tg:poll", `offline: ${error.message}; retrying with backoff`);
+        const cause = error.cause?.code || error.cause?.message;
+        if (!conflict && ++this.pollFailures === 1) this.outageStart = Date.now();
+        if (!conflict && this.pollFailures % 10 === 1) log("tg:poll", `offline (${this.pollFailures} failed polls): ${error.message}${cause ? ` (${cause})` : ""}; retrying with backoff`);
+        // A process that stays offline while the network is back never recovers by itself; let launchd KeepAlive restart it.
+        if (!conflict && Date.now() - this.outageStart > 10 * 60_000) {
+          log("tg:poll", "offline for over 10 minutes; exiting so the service manager restarts the gateway");
+          process.exit(1);
         }
         this.inConflict = conflict;
         this.currentPollAc = new AbortController();

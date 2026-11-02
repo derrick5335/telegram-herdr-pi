@@ -52,7 +52,7 @@ telegram-herdr-pi connects a Telegram bot to the interactive Pi agents that run 
 - macOS (launchd service included) or Linux (run in the foreground or under systemd)
 - [Node.js](https://nodejs.org) ≥ 22.18.0
 - [Pi](https://pi.dev) 1.3.0 (`@earendil-works/pi-coding-agent`), logged in, `pi` on `PATH`
-- [Herdr](https://herdr.dev) with its server running, `herdr` on `PATH` (the gateway never starts Herdr for you)
+- [Herdr](https://herdr.dev) with its server running, `herdr` on `PATH` (the gateway never starts Herdr for you); or the Herdr desktop app with `hc` and `herdr-app` on `PATH`
 - A Telegram bot token from [@BotFather](https://t.me/BotFather) and your numeric Telegram user id
 
 ## Quick start
@@ -108,7 +108,7 @@ In any Pi running inside a Herdr pane, a Herdr desktop (`hc`) terminal or a Rex 
 
 The session gets its own `📡` topic with the last exchange as a preview, and the Pi footer shows `📱 remote`. The setting survives `/reload` and session switches. `/remote-control off` — or `/close` in the topic — only detaches Telegram; your Pi keeps running.
 
-Herdr desktop and Rex panes are attach-only: the gateway never starts Pi there and sends no blocked-prompt previews. If that Pi disconnects, its topic asks you to run `/remote-control on` again instead of starting a second Pi.
+When the Herdr server is not running but the Herdr desktop app is, Telegram-started Pis open as tabs in a `Telegram` space (created on first use) via `hc run`; the `remote_pi=on` terminal label turns remote control on at startup, `/close` quits Pi and removes its tab, and blocked prompts are pushed from `hc events`. A Pi you attached yourself in Herdr desktop or Rex stays attach-only: if it disconnects, its topic asks you to run `/remote-control on` again instead of starting a second Pi.
 
 ### From the phone
 
@@ -186,8 +186,8 @@ Models, credentials and other extensions are configured in Pi itself.
 ## How it works
 
 - `gateway.mjs` long-polls Telegram, renders Markdown to Telegram HTML, and talks to each Pi over a private Unix socket (`bridge.sock`, mode 600) using JSON lines. Output streams as `sendMessageDraft` previews and ends with a regular `sendMessage`.
-- `remote-pi.ts` is a Pi extension built on Pi 1.3.0's public API. It forwards Pi's events, executes the gateway's requests (prompt, model, compact, new/switch session, …), adds `/remote-control`, `remote_attach` and `remote_ask`, and reconnects on its own. It detects its host from the environment (Herdr: `HERDR_ENV`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`; Herdr desktop: `HC_TERMINAL_ID`/`HC_SCOPE`; Rex: `REX_SESSION`/`REX_BLOCK`). In Herdr its on/off state is stored as pane metadata (`remote_pi=on`); elsewhere it lives in the Pi process.
-- Herdr owns the processes: the gateway talks to Herdr's socket API to create workspaces, start Pi (`agent.start`) and read screens, enables the extension through pane metadata instead of typing into a shell, receives blocked-status changes as pushed `events.subscribe` events, and binds sessions to Herdr `terminal_id`s. The only CLI call is `herdr status server --json` at startup to find the socket.
+- `remote-pi.ts` is a Pi extension built on Pi 1.3.0's public API. It forwards Pi's events, executes the gateway's requests (prompt, model, compact, new/switch session, …), adds `/remote-control`, `remote_attach` and `remote_ask`, and reconnects on its own. It detects its host from the environment (Herdr: `HERDR_ENV`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`; Herdr desktop: `HC_TERMINAL_ID`/`HC_SCOPE`; Rex: `REX_SESSION`/`REX_BLOCK`). In Herdr its on/off state is stored as pane metadata (`remote_pi=on`); elsewhere it lives in the Pi process, and in Herdr desktop a `remote_pi=on` terminal label set by the gateway enables it at startup (`/remote-control off` clears it).
+- Herdr owns the processes: the gateway talks to Herdr's socket API to create workspaces, start Pi (`agent.start`) and read screens, enables the extension through pane metadata instead of typing into a shell, receives blocked-status changes as pushed `events.subscribe` events, and binds sessions to Herdr `terminal_id`s. The only Herdr CLI call is `herdr status server --json` at startup to find the socket. Without a Herdr server, the gateway falls back to the Herdr desktop CLIs: `herdr-app ls`/`do space.new` for the `Telegram` space, `hc run`/`get`/`read`/`keys`/`kill`/`rm`, and a long-running `hc events` for blocked status.
 - Pi owns the sessions: they stay in Pi's native session directory; `state.json` only remembers which topic views which pane and session.
 - Known limits of Pi 1.3.0's public API: no native queue inspection/clearing and no auto-retry events.
 

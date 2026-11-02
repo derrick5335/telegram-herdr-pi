@@ -35,6 +35,20 @@ async function selfTestPaneBridge() {
   const path = join(dir, "bridge.sock");
   const config = { allowedUserId: "1", botToken: "1:x", stateDir: dir, cwd: dir };
   await writeFile(join(dir, "config.json"), JSON.stringify(config));
+  {
+    // Herdr desktop: the gateway's remote_pi=on launch label turns remote control on; off clears it.
+    const handlers = new Map(), commands = new Map(), hcCalls = [], statuses = [];
+    const fakePi = { on: (type, handler) => handlers.set(type, handler), registerCommand: (name, command) => commands.set(name, command),
+      registerTool: () => {}, getActiveTools: () => [], setActiveTools: () => {} };
+    const hcCtx = { mode: "tui", ui: { setStatus: (_key, text) => statuses.push(text), notify: () => {} } };
+    createRemoteBridge(fakePi, { env: { HC_TERMINAL_ID: "t9", REMOTE_PI_CONFIG: join(dir, "config.json") }, connect: () => new net.Socket(),
+      hc: async (args) => { hcCalls.push(args); return JSON.stringify({ labels: { remote_pi: "on" } }); } });
+    await handlers.get("session_start")({ type: "session_start" }, hcCtx);
+    assert.equal(statuses.at(-1), "📱 reconnecting…");
+    await commands.get("remote-control").handler("off", hcCtx);
+    assert.deepEqual([hcCalls, statuses.at(-1)], [[["get", "t9"], ["label", "t9", "remote_pi="]], undefined]);
+    delete globalThis[Symbol.for("remote-pi.enabled")];
+  }
   let gateway = new Gateway(config);
   const outputs = [];
   const events = [];
@@ -478,6 +492,40 @@ async function selfTest() {
       }
     }
     assert.equal(paneHasForegroundShell({ shell_pid: 0, foreground_process_group_id: 0 }), false);
+    activeTest = "Herdr desktop fallback: hc tab in the Telegram space, reconnect grace, label-gated replace and close.";
+    for (const mode of ["new", "stale"]) {
+      const { gw, s } = await fresh(), calls = [];
+      Object.assign(gw, { herdrSocketPath: "/fake/socket", chatReady: true, me: { has_topics_enabled: true } });
+      gw.herdr = async () => { throw new Error("connect ENOENT"); };
+      gw.bridge.server = {};
+      gw.bridge.start = async () => {};
+      s.pi.bind = () => {};
+      if (mode === "stale") s.binding = { cwd: s.cwd, paneId: "hc:t4", terminalId: "scope-4", owned: true };
+      const c = { socket: {}, clients: new Set(), hello: { paneId: "hc:t5", terminalId: "scope-5" } };
+      gw.bridge.waitFor = async (predicate, timeout) => {
+        if (timeout === 12_000) throw new Error("Timed out waiting for Pi bridge hello");
+        const views = gw.sessions.size;
+        await gw.onPaneHello(c);
+        assert.equal(gw.sessions.size, views, "the launched Pi's hello binds its own topic, not a new one");
+        assert.ok(predicate(c));
+        return c;
+      };
+      gw.desktop = async (command, ...args) => {
+        calls.push([command, ...args]);
+        if (args[0] === "ls") return JSON.stringify({ spaces: [{ id: "sp0", name: "Telegram", machine: "vps" }, { id: "sp1", name: "Telegram", machine: null }] });
+        if (args[0] === "run") return JSON.stringify({ address: "t5" });
+        return JSON.stringify(args[0] === "get" ? { state: "live", labels: { remote_pi: "on" } } : {});
+      };
+      assert.equal(await gw.startPaneSession(s.pi), true);
+      const stale = mode === "stale" ? [["hc", "get", "t4"], ["hc", "kill", "t4"], ["hc", "rm", "t4"]] : [];
+      assert.deepEqual(calls.splice(0), [...stale, ["herdr-app", "ls"], ["hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", s.cwd,
+        "--label", "remote_pi=on", "--label", "herdr.space=sp1", "--", "pi"]]);
+      assert.deepEqual([s.binding.paneId, s.binding.terminalId, s.binding.owned], ["hc:t5", "scope-5", true]);
+      s.pi.proc = {};
+      s.pi.request = async (type) => { calls.push(type); };
+      await gw.closePaneSession(s);
+      assert.deepEqual(calls, ["quit", ["hc", "get", "t5"], ["hc", "kill", "t5"], ["hc", "rm", "t5"]]);
+    }
 
     activeTest = "HTML format checks (markdown-it renderer)";
     // ref: https://nodejs.org/api/assert.html — share the equality assertion across rendering fixtures.

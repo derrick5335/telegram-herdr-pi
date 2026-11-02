@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -402,8 +402,9 @@ const isHerdrPane = (paneId) => Boolean(paneId) && !/^(hc|rex):/.test(paneId);
 const paneHasForegroundShell = (info) => Number.isInteger(info?.shell_pid) && info.shell_pid > 0 && info.foreground_process_group_id === info.shell_pid;
 
 // ref: Pi docs/rpc.md#framing; Node net IPC sockets. The directory is private and the socket is mode 0600.
+// A just-launched hc terminal is known by its fresh address until its hello reports the terminal identity.
 const matchesBinding = (binding, hello) => Boolean(binding.sessionFile) && binding.sessionFile === hello.sessionFile ||
-  binding.paneId === hello.paneId && Boolean(binding.terminalId) && binding.terminalId === hello.terminalId;
+  binding.paneId === hello.paneId && (binding.terminalId ? binding.terminalId === hello.terminalId : /^hc:/.test(binding.paneId));
 class PaneServer {
   constructor(path, onHello) {
     Object.assign(this, { path, onHello, connections: new Map(), sockets: new Set(),
@@ -954,12 +955,18 @@ class Gateway {
       // A live Pi without hello is not permission to create another writer.
       connection = await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane);
     }
+    const bound = session.binding.paneId, hcOwned = Boolean(spawn && session.binding.owned && bound?.startsWith("hc:"));
+    if (!connection && hcOwned && await this.hcOwnedTerminal(bound)) {
+      // Herdr desktop keeps our tab as a shell after Pi exits; give a running Pi time to reconnect before replacing it.
+      connection = await this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello), 12_000).catch(() => null);
+      if (!connection) await this.closeHcTerminal(bound);
+    }
     if (!connection) {
       if (!spawn) return false;
       // A disconnected Pi in another host may still be running; starting a Herdr copy would add a second writer.
-      if (session.binding.paneId && !isHerdrPane(session.binding.paneId)) throw new Error(`Pi in ${session.binding.paneId} is not connected; run /remote-control on there`);
+      if (bound && !isHerdrPane(bound) && !hcOwned) throw new Error(`Pi in ${bound} is not connected; run /remote-control on there`);
       if (!this.herdrSocketPath) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
-      let pane = await this.ownedPane(session.binding), created = false;
+      let pane = hcOwned ? null : await this.ownedPane(session.binding), created = false;
       if (!pane?.pane_id) {
         const label = `${basename(session.cwd) || "remote-pi"}${session.threadId ? `#${session.threadId}` : ""}`;
         try {
@@ -967,21 +974,23 @@ class Gateway {
           created = Boolean(pane?.pane_id);
         } catch (error) { log("herdr", `failed to create workspace for ${session.cwd}: ${error.message}`); }
       }
-      if (!pane?.pane_id) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
-      const paneId = pane.pane_id;
-      session.binding = { ...session.binding, paneId, terminalId: pane.terminal_id, cwd: session.cwd, owned: true };
-      await this.persistPaneSession(session);
-      const shell = await this.waitForShell(paneId, created ? 10 : 1);
-      if (!shell && pane.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
-      const waiting = this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello));
-      waiting.catch(() => {}); // agent start may outlive the hello deadline.
-      if (shell) {
-        // ref: Herdr `herdr api schema --json`: PaneReportMetadataParams — enable attachment without shell input.
-        await this.herdr("pane.report_metadata", { pane_id: paneId, source: "remote-pi", tokens: { remote_pi: "on" } });
-        await this.herdr("agent.start", { name: `remote-${randomBytes(6).toString("hex")}`, kind: "pi", pane_id: paneId,
-          args: file ? ["--session", file] : [], timeout_ms: 45_000 });
+      if (!pane?.pane_id) connection = await this.startHcPane(session, file);
+      else {
+        const paneId = pane.pane_id;
+        session.binding = { ...session.binding, paneId, terminalId: pane.terminal_id, cwd: session.cwd, owned: true };
+        await this.persistPaneSession(session);
+        const shell = await this.waitForShell(paneId, created ? 10 : 1);
+        if (!shell && pane.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
+        const waiting = this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello));
+        waiting.catch(() => {}); // agent start may outlive the hello deadline.
+        if (shell) {
+          // ref: Herdr `herdr api schema --json`: PaneReportMetadataParams — enable attachment without shell input.
+          await this.herdr("pane.report_metadata", { pane_id: paneId, source: "remote-pi", tokens: { remote_pi: "on" } });
+          await this.herdr("agent.start", { name: `remote-${randomBytes(6).toString("hex")}`, kind: "pi", pane_id: paneId,
+            args: file ? ["--session", file] : [], timeout_ms: 45_000 });
+        }
+        connection = await waiting;
       }
-      connection = await waiting;
     }
     rpc.bind(connection);
     await this.persistPaneSession(session);
@@ -994,6 +1003,40 @@ class Gateway {
     try { pane = (await this.herdr("pane.get", { pane_id: binding.paneId }))?.pane; } catch {}
     return pane?.terminal_id === binding.terminalId ? pane : null;
   }
+  // Herdr desktop (herdr-core) when the Herdr server is down: Pi opens as a tab in the "Telegram" space, and the
+  // remote_pi=on label tells the extension to attach at startup. ref: `hc --skill`, `herdr-app --skill` (herdr.space labels).
+  async startHcPane(session, file) {
+    let space = null, address;
+    try {
+      space = JSON.parse(await this.desktop("herdr-app", "ls")).spaces.find((s) => s.name === "Telegram" && !s.machine)?.id ||
+        JSON.parse(await this.desktop("herdr-app", "do", "space.new", "--name", "Telegram", "--folder", session.cwd)).space;
+    } catch (error) { log("herdr", `Herdr window unavailable; Pi starts hidden: ${error.message}`); }
+    try {
+      ({ address } = JSON.parse(await this.desktop("hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", session.cwd,
+        "--label", "remote_pi=on", ...(space ? ["--label", `herdr.space=${space}`] : []), "--", "pi", ...(file ? ["--session", file] : []))));
+    } catch (error) {
+      log("herdr", `hc run failed: ${error.message}`);
+      throw new Error("Herdr is required: open Herdr desktop or start the herdr server");
+    }
+    const paneId = `hc:${address}`;
+    session.binding = { ...session.binding, paneId, terminalId: undefined, cwd: session.cwd, owned: true };
+    await this.persistPaneSession(session);
+    const connection = await this.bridge.waitFor((c) => c.hello.paneId === paneId);
+    session.binding.terminalId = connection.hello.terminalId;
+    return connection;
+  }
+  // The label guards against acting on a terminal that is no longer ours (address reuse or /remote-control off).
+  async hcOwnedTerminal(paneId) {
+    const terminal = await this.desktop("hc", "get", paneId.slice(3)).then(JSON.parse).catch(() => null);
+    return terminal?.state === "live" && terminal.labels?.remote_pi === "on";
+  }
+  async closeHcTerminal(paneId) {
+    for (const command of ["kill", "rm"]) await this.desktop("hc", command, paneId.slice(3)).catch(() => {});
+  }
+  async desktop(command, ...args) {
+    if (HERDR_DISABLED_FOR_TEST) throw new Error(`Self-test must never call ${command}: ${args[0]}`);
+    return execFileAsync(command, args, { timeout: 10_000, killSignal: "SIGKILL" }).then((r) => r.stdout);
+  }
   async closePaneSession(session) {
     const otherViews = [...this.sessions.values()].filter((s) => s !== session && matchesBinding(s.binding, session.binding));
     for (const other of otherViews) {
@@ -1005,6 +1048,8 @@ class Gateway {
       const paneId = session.binding.paneId;
       if (!await this.waitForShell(paneId, 30)) throw new Error("Pi has not exited; pane and topic were kept");
       await this.herdr("pane.close", { pane_id: paneId });
+    } else if (!otherViews.length && session.binding.owned && session.binding.paneId?.startsWith("hc:") && await this.hcOwnedTerminal(session.binding.paneId)) {
+      await this.closeHcTerminal(session.binding.paneId);
     }
     session.stop();
   }
@@ -1077,6 +1122,7 @@ class Gateway {
     const attached = await this.ensurePaneSession(this.mainSession.pi, { spawn: false }).catch(() => false);
     await this.registerBotCommands();
     this.syncBlockedSubscription();
+    this.watchHcStatus();
     for (const connection of this.bridge.connections.values()) await this.onPaneHello(connection);
     this.cleanupDownloads();
     this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000).unref();
@@ -1271,7 +1317,8 @@ class Gateway {
     for (const session of sessions) {
       if (!session.isStreaming || session.uiMessages?.size) continue;
       const connection = session.pi.connection;
-      screen ??= (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text ?? "";
+      screen ??= isHerdrPane(paneId) ? (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text ?? ""
+        : await this.desktop("hc", "read", paneId.slice(3));
       if (this.blockedStatuses.get(paneId) !== "blocked" || session.pi.connection !== connection || !session.pi.proc ||
         session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
       const group = randomBytes(6).toString("hex");
@@ -1282,6 +1329,19 @@ class Gateway {
         disable_notification: this.isUserPresent(),
       });
     }
+  }
+  // Herdr desktop panes: hc's event stream is a snapshot, then fact changes; status records carry blocked state.
+  // ref: `hc schema` events.subscribe (herdr-core). Unknown terminals are ignored by onAgentStatus.
+  watchHcStatus(retries = 0) {
+    if (this.stopping) return;
+    const child = this.hcEvents = spawn("hc", ["events", "--json"], { stdio: ["ignore", "pipe", "ignore"] });
+    let chain = Promise.resolve();
+    readJsonLines(child.stdout, (msg) => {
+      const updates = msg.terminals ? msg.terminals.map((t) => [t.address, t.status]) : msg.params?.type === "status" ? [[msg.params.terminal, msg.params.data]] : [];
+      for (const [address, status] of updates) chain = chain.then(() => this.onAgentStatus(`hc:${address}`, status?.state)).catch((e) => log("blocked", e.message));
+    }, false);
+    child.on("error", () => {}); // hc missing: retry quietly; close follows.
+    child.on("close", () => { if (!this.stopping) setTimeout(() => this.watchHcStatus(retries + 1), reconnectDelayMs(retries)).unref(); });
   }
   syncBlockedSubscription(connect = net.createConnection) {
     if (this.stopping || HERDR_DISABLED_FOR_TEST && connect === net.createConnection || !this.herdrSocketPath) return;
@@ -1381,9 +1441,10 @@ class Gateway {
         case "herdr_keys": {
           this.dropActions((value) => value.group === action.group);
           const target = this.sessions.get(action.sessionKey);
-          const agent = (await this.herdr("agent.get", { target: action.paneId }))?.agent;
-          if (target?.pi.proc && target.binding.paneId === action.paneId && target.pi.connection?.hello.paneId === action.paneId && !target.uiMessages?.size && agent?.agent_status === "blocked") {
-            await this.herdr("agent.send_keys", { target: action.paneId, keys: [action.key] });
+          const hcAddress = isHerdrPane(action.paneId) ? null : action.paneId.slice(3);
+          const status = hcAddress ? JSON.parse(await this.desktop("hc", "get", hcAddress)).status?.state : (await this.herdr("agent.get", { target: action.paneId }))?.agent?.agent_status;
+          if (target?.pi.proc && target.binding.paneId === action.paneId && target.pi.connection?.hello.paneId === action.paneId && !target.uiMessages?.size && status === "blocked") {
+            await (hcAddress ? this.desktop("hc", "keys", hcAddress, action.key) : this.herdr("agent.send_keys", { target: action.paneId, keys: [action.key] }));
           } else await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
           if (callback?.message) await this.telegram.clearKeyboard(callback.message.chat.id, callback.message.message_id);
           return;
@@ -1447,6 +1508,7 @@ class Gateway {
     clearTimeout(this.herdrSubTimer);
     this.herdrSubSocket?.destroy();
     this.herdrSubSocket = null;
+    this.hcEvents?.kill();
     this.bridge?.stop().catch((error) => log("bridge", `stop: ${error.message}`));
     try { this.lockServer?.close(); } catch {}
     this.lockServer = null;

@@ -988,40 +988,47 @@ class Gateway {
       connection = await this.bridge.waitFor((c) => c.hello.sessionFile === file && c.hello.paneId === livePane);
     }
     const bound = session.binding.paneId, hcOwned = Boolean(spawn && session.binding.owned && bound?.startsWith("hc:"));
+    const rexOwned = Boolean(spawn && session.binding.owned && bound?.startsWith("rex:"));
     if (!connection && hcOwned && await this.hcOwnedTerminal(bound)) {
       // Herdr desktop keeps our tab as a shell after Pi exits; give a running Pi time to reconnect before replacing it.
       connection = await this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello), 12_000).catch(() => null);
-      if (!connection) await this.closeHcTerminal(bound);
+      if (!connection) {
+        await this.closeHcTerminal(bound);
+        session.binding = { ...session.binding, paneId: undefined, terminalId: undefined };
+      }
+    }
+    if (!connection && rexOwned && await this.rexOwnedBlock(bound)) {
+      connection = await this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello), 12_000).catch(() => null);
+      if (!connection) {
+        await this.closeRexBlock(bound);
+        session.binding = { ...session.binding, paneId: undefined, terminalId: undefined };
+      }
     }
     if (!connection) {
       if (!spawn) return false;
-      // A disconnected Pi in another host may still be running; starting a Herdr copy would add a second writer.
-      if (bound && !isHerdrPane(bound) && !hcOwned) throw new Error(`Pi in ${bound} is not connected; run /remote-control on there`);
-      if (!this.herdrSocketPath) throw new Error("Herdr is required: install herdr and ensure its server is reachable");
-      let pane = hcOwned ? null : await this.ownedPane(session.binding), created = false;
-      if (!pane?.pane_id) {
-        const label = `${basename(session.cwd) || "remote-pi"}${session.threadId ? `#${session.threadId}` : ""}`;
-        try {
-          pane = (await this.herdr("workspace.create", { cwd: session.cwd, label, focus: false }))?.root_pane;
-          created = Boolean(pane?.pane_id);
-        } catch (error) { log("herdr", `failed to create workspace for ${session.cwd}: ${error.message}`); }
-      }
-      if (!pane?.pane_id) connection = await this.startHcPane(session, file);
+      // A disconnected Pi in another host may still be running; starting another copy would add a second writer.
+      if (bound && !isHerdrPane(bound) && !hcOwned && !rexOwned) throw new Error(`Pi in ${bound} is not connected; run /remote-control on there`);
+      const existingPane = await this.ownedPane(session.binding);
+      if (existingPane) connection = await this.startHerdrPane(session, file, existingPane);
       else {
-        const paneId = pane.pane_id;
-        session.binding = { ...session.binding, paneId, terminalId: pane.terminal_id, cwd: session.cwd, owned: true };
-        await this.persistPaneSession(session);
-        const shell = await this.waitForShell(paneId, created ? 10 : 1);
-        if (!shell && pane.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
-        const waiting = this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello));
-        waiting.catch(() => {}); // agent start may outlive the hello deadline.
-        if (shell) {
-          // ref: Herdr `herdr api schema --json`: PaneReportMetadataParams — enable attachment without shell input.
-          await this.herdr("pane.report_metadata", { pane_id: paneId, source: "remote-pi", tokens: { remote_pi: "on" } });
-          await this.herdr("agent.start", { name: `remote-${randomBytes(6).toString("hex")}`, kind: "pi", pane_id: paneId,
-            args: file ? ["--session", file] : [], timeout_ms: 45_000 });
+        // Spawn order for a Telegram-started Pi: hc → Rex → Herdr TUI
+        const attempts = [
+          () => this.startHcPane(session, file),
+          () => this.startRexPane(session, file),
+          () => this.startHerdrPane(session, file),
+        ];
+        for (const attempt of attempts) {
+          const prevPaneId = session.binding.paneId;
+          try {
+            connection = await attempt();
+            if (connection) break;
+          } catch (error) {
+            // Once the terminal/block exists, never fall through to another host (prevents multiple writers).
+            if (session.binding.paneId && session.binding.paneId !== prevPaneId) throw error;
+            log("spawn", error.message);
+          }
         }
-        connection = await waiting;
+        if (!connection) throw new Error("No supported host available: start Herdr desktop (hc), Rex, or Herdr TUI");
       }
     }
     rpc.bind(connection);
@@ -1030,10 +1037,34 @@ class Gateway {
   }
   // The terminal_id check guards against Herdr reusing a pane ID for another terminal.
   async ownedPane(binding) {
-    if (!binding.owned || !binding.paneId || !binding.terminalId) return null;
+    if (!this.herdrSocketPath || !binding.owned || !binding.paneId || !binding.terminalId || !isHerdrPane(binding.paneId)) return null;
     let pane = null;
     try { pane = (await this.herdr("pane.get", { pane_id: binding.paneId }))?.pane; } catch {}
     return pane?.terminal_id === binding.terminalId ? pane : null;
+  }
+  async startHerdrPane(session, file, existingPane = null) {
+    if (!this.herdrSocketPath) throw new Error("Herdr TUI is unavailable");
+    let pane = existingPane, created = false;
+    if (!pane?.pane_id) {
+      const label = `${basename(session.cwd) || "remote-pi"}${session.threadId ? `#${session.threadId}` : ""}`;
+      pane = (await this.herdr("workspace.create", { cwd: session.cwd, label, focus: false }))?.root_pane;
+      created = Boolean(pane?.pane_id);
+    }
+    if (!pane?.pane_id) throw new Error(`Failed to create Herdr workspace for ${session.cwd}`);
+    const paneId = pane.pane_id;
+    session.binding = { ...session.binding, paneId, terminalId: pane.terminal_id, cwd: session.cwd, owned: true };
+    await this.persistPaneSession(session);
+    const shell = await this.waitForShell(paneId, created ? 10 : 1);
+    if (!shell && pane.agent !== "pi") throw new Error(`Pane ${paneId} is busy; no terminal input was sent`);
+    const waiting = this.bridge.waitFor((c) => matchesBinding(session.binding, c.hello));
+    waiting.catch(() => {}); // agent start may outlive the hello deadline.
+    if (shell) {
+      // ref: Herdr `herdr api schema --json`: PaneReportMetadataParams — enable attachment without shell input.
+      await this.herdr("pane.report_metadata", { pane_id: paneId, source: "remote-pi", tokens: { remote_pi: "on" } });
+      await this.herdr("agent.start", { name: `remote-${randomBytes(6).toString("hex")}`, kind: "pi", pane_id: paneId,
+        args: file ? ["--session", file] : [], timeout_ms: 45_000 });
+    }
+    return await waiting;
   }
   // Herdr desktop (herdr-core) when the Herdr server is down: Pi opens as a new tab in its project's space, and the
   // remote_pi=on label tells the extension to attach at startup. ref: `hc --skill`, `herdr-app --skill` (herdr.space labels).
@@ -1042,14 +1073,8 @@ class Gateway {
       log("herdr", `cannot match a Herdr space: ${error.message}`);
       return null;
     });
-    let address;
-    try {
-      ({ address } = JSON.parse(await this.cli("hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", session.cwd,
-        "--label", "remote_pi=on", "--label", `herdr.space=${space || `sp${randomBytes(16).toString("hex")}`}`, "--", "pi", ...(file ? ["--session", file] : []))));
-    } catch (error) {
-      log("herdr", `hc run failed: ${error.message}`);
-      throw new Error("Herdr is required: open Herdr desktop or start the herdr server");
-    }
+    const { address } = JSON.parse(await this.cli("hc", "run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", session.cwd,
+      "--label", "remote_pi=on", "--label", `herdr.space=${space || `sp${randomBytes(16).toString("hex")}`}`, "--", "pi", ...(file ? ["--session", file] : [])));
     const paneId = `hc:${address}`;
     session.binding = { ...session.binding, paneId, terminalId: undefined, cwd: session.cwd, owned: true };
     await this.persistPaneSession(session);
@@ -1057,16 +1082,54 @@ class Gateway {
     session.binding.terminalId = connection.hello.terminalId;
     return connection;
   }
+  // Rex launch mirrors hc: place in session with matching repo root, or new session named after cwd.
+  // ref: https://www.superlogical.com/rex/docs/reference/cli — block label remote-pi marks ownership.
+  async startRexPane(session, file) {
+    const matched = await this.rexSession(session.cwd).catch(() => null);
+    const piArgs = ["pi", ...(file ? ["--session", file] : [])];
+    let blockId;
+    if (matched) {
+      const out = await this.cli("rex", "window", "new", "-s", matched, "--focus=false", "-c", session.cwd, "--json", "--autostart=false", "--", ...piArgs);
+      blockId = JSON.parse(out).block_ids?.[0];
+    } else {
+      const name = basename(session.cwd) || "remote-pi";
+      const out = await this.cli("rex", "new", name, "-c", session.cwd, "--json", "--autostart=false", "--", ...piArgs);
+      blockId = JSON.parse(out).initial_windows?.[0]?.block_ids?.[0];
+    }
+    if (!blockId) throw new Error("Rex failed to create block");
+    const paneId = `rex:${blockId}`;
+    session.binding = { ...session.binding, paneId, terminalId: undefined, cwd: session.cwd, owned: true };
+    await this.persistPaneSession(session);
+    // shortcut: rex block rename races with Pi session_start, upgrade when Rex supports --label on rex new and rex window new.
+    await this.cli("rex", "block", "rename", blockId, "remote-pi", "--autostart=false");
+    const connection = await this.bridge.waitFor((c) => c.hello.paneId === paneId);
+    session.binding.terminalId = connection.hello.terminalId;
+    return connection;
+  }
+  async rexSession(cwd) {
+    const target = await this.repoRoot(cwd);
+    const sessions = JSON.parse(await this.cli("rex", "ls", "--json", "--autostart=false")).sessions || [];
+    for (const s of sessions) {
+      const blocks = JSON.parse(await this.cli("rex", "block", "ls", "-s", s.session_id, "--json", "--autostart=false")).blocks || [];
+      const first = blocks[0]?.block_id;
+      const proc = first && await this.cli("rex", "block", "call", "-b", first, "process", "--autostart=false").then(JSON.parse, () => null);
+      const procCwd = proc?.foreground?.cwd || proc?.child?.cwd;
+      if (procCwd && await this.repoRoot(procCwd) === target) return s.session_id;
+    }
+    return null;
+  }
+  repoRoot(dir) {
+    return this.cli("git", "-C", dir, "rev-parse", "--show-toplevel").then((out) => out.trim(), () => dir);
+  }
   // Herdr names an unnamed space after its first terminal's live repo (else folder); reuse the space whose first terminal
   // is in the same repo. An unknown herdr.space id makes Herdr create a new, auto-named space.
   // ref: ~/.config/herdr-app/AGENTS.md "The model: spaces, tabs, terminals".
   async hcSpace(cwd) {
-    const repo = (dir) => this.cli("git", "-C", dir, "rev-parse", "--show-toplevel").then((out) => out.trim(), () => dir);
-    const target = await repo(cwd);
+    const target = await this.repoRoot(cwd);
     for (const space of JSON.parse(await this.cli("herdr-app", "ls")).spaces) {
       const first = space.tabs[0]?.terminals[0]?.terminal;
       const terminal = !space.machine && first && await this.cli("hc", "get", first).then(JSON.parse, () => null);
-      if (terminal && await repo(terminal.foreground?.cwd || terminal.cwd) === target) return space.id;
+      if (terminal && await this.repoRoot(terminal.foreground?.cwd || terminal.cwd) === target) return space.id;
     }
     return null;
   }
@@ -1077,6 +1140,13 @@ class Gateway {
   }
   async closeHcTerminal(paneId) {
     for (const command of ["kill", "rm"]) await this.cli("hc", command, paneId.slice(3)).catch(() => {});
+  }
+  async rexOwnedBlock(paneId) {
+    const block = await this.cli("rex", "block", "inspect", paneId.slice(4), "--json", "--autostart=false").then(JSON.parse).catch(() => null);
+    return block?.block?.label === "remote-pi";
+  }
+  async closeRexBlock(paneId) {
+    await this.cli("rex", "block", "close", paneId.slice(4), "--autostart=false").catch(() => {});
   }
   async cli(command, ...args) {
     if (HERDR_DISABLED_FOR_TEST) throw new Error(`Self-test must never call ${command}: ${args[0]}`);
@@ -1095,6 +1165,8 @@ class Gateway {
       await this.herdr("pane.close", { pane_id: paneId });
     } else if (!otherViews.length && session.binding.owned && session.binding.paneId?.startsWith("hc:") && await this.hcOwnedTerminal(session.binding.paneId)) {
       await this.closeHcTerminal(session.binding.paneId);
+    } else if (!otherViews.length && session.binding.owned && session.binding.paneId?.startsWith("rex:") && await this.rexOwnedBlock(session.binding.paneId)) {
+      await this.closeRexBlock(session.binding.paneId);
     }
     session.stop();
   }
@@ -1159,10 +1231,7 @@ class Gateway {
     }
     await this.acquireLock();
     if (HERDR_DISABLED_FOR_TEST) throw new Error("Self-test cannot start the gateway");
-    try {
-      const { stdout } = await execFileAsync("herdr", ["status", "server", "--json"], { timeout: 5000, killSignal: "SIGKILL" });
-      this.herdrSocketPath = JSON.parse(stdout).socket;
-    } catch { throw new Error("Herdr is required: install herdr and ensure its server is reachable"); }
+    await this.initHerdr();
     await this.bridge.start();
     // Independent startup probes; getChat only decides whether the private chat already exists.
     ({ me: this.me, chatReady: this.chatReady } = await this.telegram.startupProbes(this.chatId));
@@ -1178,6 +1247,15 @@ class Gateway {
     log("gateway", `@${this.me.username} ready; Pi ${attached ? "attached" : "not attached (starts on first message)"}`);
     await this.completeRestart();
     await this.telegram.poll((update) => this.dispatchUpdate(update));
+  }
+  async initHerdr(exec = execFileAsync) {
+    try {
+      const { stdout } = await exec("herdr", ["status", "server", "--json"], { timeout: 5000, killSignal: "SIGKILL" });
+      this.herdrSocketPath = JSON.parse(stdout).socket || null;
+    } catch (error) {
+      this.herdrSocketPath = null;
+      log("herdr", `server unavailable: ${error.message}; continuing without Herdr TUI`);
+    }
   }
   async completeRestart() {
     if (!this.state.pendingRestartMessageId) return;
@@ -1350,6 +1428,7 @@ class Gateway {
     return herdrRequest({ HERDR_SOCKET_PATH: this.herdrSocketPath }, method, params);
   }
   async waitForShell(paneId, attempts) {
+    if (!this.herdrSocketPath) return false;
     for (let i = 0; i < attempts; i++) {
       if (paneHasForegroundShell((await this.herdr("pane.process_info", { pane_id: paneId }))?.process_info)) return true;
       if (i + 1 < attempts) await sleep(100);
@@ -1381,19 +1460,19 @@ class Gateway {
   }
   // Rex block ids are globally unique, so `rex` targets them without -s; the root OSC 7501 record is the pane status.
   paneStatus(paneId) {
-    if (isHerdrPane(paneId)) return this.herdr("agent.get", { target: paneId }).then((r) => r?.agent?.agent_status);
-    if (paneId.startsWith("rex:")) return this.cli("rex", "block", "call", "-b", paneId.slice(4), "program_status")
+    if (isHerdrPane(paneId)) return this.herdrSocketPath ? this.herdr("agent.get", { target: paneId }).then((r) => r?.agent?.agent_status) : Promise.resolve(null);
+    if (paneId.startsWith("rex:")) return this.cli("rex", "block", "call", "-b", paneId.slice(4), "program_status", "--autostart=false")
       .then((out) => JSON.parse(out).records?.find((record) => !record.id)?.state);
     return this.cli("hc", "get", paneId.slice(3)).then(JSON.parse).then((t) => t.status?.state);
   }
   sendPaneKeys(paneId, key) {
-    if (isHerdrPane(paneId)) return this.herdr("agent.send_keys", { target: paneId, keys: [key] });
-    if (paneId.startsWith("rex:")) return this.cli("rex", "send-key", "-b", paneId.slice(4), key === "esc" ? "escape" : key);
+    if (isHerdrPane(paneId)) return this.herdrSocketPath ? this.herdr("agent.send_keys", { target: paneId, keys: [key] }) : Promise.resolve();
+    if (paneId.startsWith("rex:")) return this.cli("rex", "send-key", "-b", paneId.slice(4), key === "esc" ? "escape" : key, "--autostart=false");
     return this.cli("hc", "keys", paneId.slice(3), key);
   }
   paneScreen(paneId) {
-    if (isHerdrPane(paneId)) return this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }).then((r) => r?.read?.text ?? "");
-    return this.cli(...(paneId.startsWith("rex:") ? ["rex", "capture", "-b", paneId.slice(4), "--trim"] : ["hc", "read", paneId.slice(3)]));
+    if (isHerdrPane(paneId)) return this.herdrSocketPath ? this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }).then((r) => r?.read?.text ?? "") : Promise.resolve("");
+    return this.cli(...(paneId.startsWith("rex:") ? ["rex", "capture", "-b", paneId.slice(4), "--trim", "--autostart=false"] : ["hc", "read", paneId.slice(3)]));
   }
   // Herdr desktop panes: hc's event stream is a snapshot, then fact changes; status records carry blocked state.
   // ref: `hc schema` events.subscribe (herdr-core). Unknown terminals are ignored by onAgentStatus.

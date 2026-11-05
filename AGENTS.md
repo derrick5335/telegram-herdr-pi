@@ -14,7 +14,7 @@
 
 ## 运维速查
 
-- 依赖：Node.js >=22.18.0、已认证的 Pi CLI 1.3.0、Herdr（必需，`pi` 与 `herdr` 均需位于 PATH）
+- 依赖：Node.js >=22.18.0、已认证的 Pi CLI 1.3.0、至少一种宿主环境（Herdr 桌面版、Rex 或 Herdr TUI；`pi` 需位于 PATH）
 - 日志：`~/.local/var/log/remote-pi.log`（可用 `REMOTE_PI_LOG_FILE` 覆盖；排障先 tail 它）
 - 服务：`pi-remote-gateway start|stop|restart|status|logs`（仅经用户授权执行变更）
 - 配置：`~/.config/remote-pi/config.json`（bot token，mode 600；可选 `sttCommand` 语音转写）
@@ -31,8 +31,10 @@
 - `remote-pi.ts`：统一、有类型的 Pi extension，通过公开 Extension API 实现 RPC 形状的桥接命令与事件转发，提供 `/remote-control on|off|status`。Herdr 原生 pane metadata token `remote_pi=on` 保存开关，扩展自动重连；会话替换后由新 runtime 的 hello 恢复绑定。
 - `remote_attach` / `remote_ask`：统一扩展中的两个工具，仅连接期间启用；后者同时在 Telegram 与 TUI 显示，先回答者生效并取消另一端。断线重连保持待答提问有效并在重连后重发，显式断开才取消。其他扩展的 TUI 对话不代理，只提供 Herdr blocked 屏幕预览与 Enter/Esc 控件，不解析编号选项。
 - 绑定与生命周期：会话按 Herdr `terminal_id` 匹配实际终端，避免窗格 ID 复用导致误绑或误关。Telegram 客户端删除的 Topic 在下次投递失败时自动对齐清理。`/new` 与 `/resume` 替换请求采用 60s 超时并向用户反馈清晰错误。
+- 启动派生顺序与宿主支持：从 Telegram 启动新 Pi 时按 hc → Rex → Herdr TUI 顺序尝试。已有自有绑定优先复用。Herdr TUI 为可选，启动时 `herdr status server --json` 探测失败不再退出，置 `herdrSocketPath` 为 null 并继续运行，所有 Herdr socket 路径均对 `herdrSocketPath` 保护。
+- Herdr 桌面版：经 `hc run --bg --no-parent` 以新标签页在同一项目的 space 启动 Pi（`herdr-app ls` + `hc get` 取各 space 首个终端的实时 cwd，按 `git rev-parse --show-toplevel`（否则文件夹）匹配；无匹配则用新的随机 `herdr.space` id，由 Herdr 新建并自动命名，不用 `space.new --name`，否则名称固定不再跟随），并打 `remote_pi=on` 终端标签；扩展启动时用 `hc get` 读取该标签，`/remote-control off` 清除。`/close` 只在标签仍为 on 时 `hc kill`+`hc rm`；未连接的自有 hc 终端先给 12s 重连宽限再替换（桌面版会把退出后的标签页保留为 shell）。blocked 状态来自常驻 `hc events`，屏幕/按键走 `hc read`/`hc keys`。
+- Rex 宿主：镜像 `hc` 逻辑，匹配各 session 首个 block 的 foreground cwd 对应的 git 根目录，匹配则 `rex window new -s <session> --focus=false`，无匹配则 `rex new <name>`；创建后将 block label 重命名为 `remote-pi` 作为所有权标记。扩展在 `session_start` 读取自身 block label 为 `remote-pi` 时自动启用；`/remote-control off` 重命名为 `pi`。`/close` 只在仍标记 `remote-pi` 时 `rex block close`；未连接的自有 block 同样享有 12s 重连宽限。所有 gateway `rex` CLI 调用均传 `--autostart=false`。
 - blocked 推送：通过 Herdr `events.subscribe` 订阅已绑定且已连接窗格的 `pane.agent_status_changed`，绑定变化重新订阅，socket 关闭后指数退避重连，每次订阅执行一次 `agent.list` 对齐状态，不定期轮询。工作期间进入 blocked 时发送屏幕预览与 Enter/Esc；已有 `remote_ask` 按钮时不重复提醒，回调重新验证 blocked。Rex 窗格镜像同一提示流：常驻 `rex events --all --json`（`--autostart=false`）子进程把 OSC 7501 根记录（`program_status_changed`/`program_status_removed`）映射为 blocked 状态，断线同一退避重连；屏幕预览走 `rex capture --trim`，Enter/Esc 走 `rex send-key`。
-- Herdr 桌面版回退：Herdr 服务端不可达（`workspace.create` 失败）时，经 `hc run --bg --no-parent` 以新标签页在同一项目的 space 启动 Pi（`herdr-app ls` + `hc get` 取各 space 首个终端的实时 cwd，按 `git rev-parse --show-toplevel`（否则文件夹）匹配；无匹配则用新的随机 `herdr.space` id，由 Herdr 新建并自动命名，不用 `space.new --name`，否则名称固定不再跟随），并打 `remote_pi=on` 终端标签；扩展启动时用 `hc get` 读取该标签，`/remote-control off` 清除。`/close` 只在标签仍为 on 时 `hc kill`+`hc rm`；未连接的自有 hc 终端先给 12s 重连宽限再替换（桌面版会把退出后的标签页保留为 shell）。blocked 状态来自常驻 `hc events`，屏幕/按键走 `hc read`/`hc keys`。
 - 启动：`agent.start` 前先经 Herdr `pane.report_metadata` 设置 `remote_pi=on`，保留前台 Shell 检查；不注入 Shell `export` 或 `pane run`。扩展经配置解析 `bridge.sock`，不使用 `REMOTE_PI_ATTACH` / `REMOTE_PI_BRIDGE_SOCKET`。
 - Herdr 通信：生命周期操作统一走 socket API；只在启动时经 promisified `execFile` 执行一次 `herdr status server --json`（5 秒超时）发现 socket。语音转写共用该 helper，执行 `bash -c <sttCommand> stt <path>`，超时 120 秒。`agent.start` 使用 `timeout_ms: 45000`，请求额外预留 2 秒通信时间。
 - 命令菜单：仅注册默认 scope 的 `setMyCommands`。旧的 `all_private_chats` 等更具体 scope 会覆盖默认菜单，清理属于需单独授权的迁移操作。

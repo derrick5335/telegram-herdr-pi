@@ -96,15 +96,17 @@ function wireEvent({ type, ...event }: any) {
 
 // ref: `hc --skill` (herdr-core) — piped output is JSON; labels are the per-terminal key=value store.
 const hcCli = (args: string[]) => new Promise<string>((done, fail) => execFile("hc", args, { timeout: 5000 }, (error, stdout) => error ? fail(error) : done(stdout)));
+// ref: https://www.superlogical.com/rex/docs/reference/cli — Rex blocks use visible labels as markers.
+const rexCli = (args: string[]) => new Promise<string>((done, fail) => execFile("rex", args, { timeout: 5000 }, (error, stdout) => error ? fail(error) : done(stdout)));
 // ref: Pi docs/extensions.md#context-and-session-changes; dist/core/extensions/types.d.ts.
 // Lazy public import keeps the framing helpers usable by plain Node without a local Pi installation.
 const listPiSessions = async (cwd: string, dir?: string) => (await import("@earendil-works/pi-coding-agent")).SessionManager.list(cwd, dir);
 type BridgeOptions = {
   env?: Record<string, string | undefined>; metadata?: typeof herdrRequest;
-  connect?: typeof net.createConnection; listSessions?: typeof listPiSessions; hc?: typeof hcCli;
+  connect?: typeof net.createConnection; listSessions?: typeof listPiSessions; hc?: typeof hcCli; rex?: typeof rexCli;
 };
 export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}) {
-  const { env = process.env, metadata = herdrRequest, connect = net.createConnection, listSessions = listPiSessions, hc = hcCli } = options;
+  const { env = process.env, metadata = herdrRequest, connect = net.createConnection, listSessions = listPiSessions, hc = hcCli, rex = rexCli } = options;
   let ctx: ExtensionContext, socket: net.Socket | null = null, retryTimer: ReturnType<typeof setTimeout> | null = null;
   let path: string, terminalId: string | undefined, retries = 0, connectedAt = 0, enabled = false, disposed = false, startEvent: Partial<SessionStartEvent> = {};
   const dialogs = new Map<string, { finish: (value?: string, error?: unknown) => void; request: { options: string[] } & Record<string, unknown> }>();
@@ -128,6 +130,7 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     processState[REMOTE_ON] = on;
     // The gateway launches Herdr desktop Pis with remote_pi=on; clear it so a later Pi in this tab stays detached.
     if (!on && host?.kind === "herdr-app") await hc(["label", env.HC_TERMINAL_ID!, "remote_pi="]).catch(() => {});
+    if (!on && host?.kind === "rex") await rex(["block", "rename", env.REX_BLOCK!, "pi", "--autostart=false"]).catch(() => {});
   };
   // ref: Claude Code Remote Control shows persistent active indicator (https://code.claude.com/docs/en/remote-control)
   const setStatus = (text?: string) => {
@@ -372,8 +375,11 @@ export function createRemoteBridge(pi: ExtensionAPI, options: BridgeOptions = {}
     setTools(false);
     if (!host) return;
     const pane = herdr ? await metadata(env, "pane.get", { pane_id: paneId! }).catch(() => null) : undefined;
-    enabled = herdr ? pane?.pane?.tokens?.remote_pi === "on" : processState[REMOTE_ON] ?? (host.kind === "herdr-app" &&
-      await hc(["get", env.HC_TERMINAL_ID!]).then((out) => JSON.parse(out).labels?.remote_pi === "on", () => false));
+    enabled = herdr ? pane?.pane?.tokens?.remote_pi === "on" : processState[REMOTE_ON] ?? (
+      host.kind === "herdr-app" ? await hc(["get", env.HC_TERMINAL_ID!]).then((out) => JSON.parse(out).labels?.remote_pi === "on", () => false)
+      : host.kind === "rex" ? await rex(["block", "inspect", env.REX_BLOCK!, "--json", "--autostart=false"]).then((out) => JSON.parse(out).block?.label === "remote-pi", () => false)
+      : false
+    );
     if (enabled) await setEnabled(true, pane); else setStatus(undefined);
   });
   pi.on("session_shutdown", async (event) => {

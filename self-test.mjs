@@ -49,6 +49,20 @@ async function selfTestPaneBridge() {
     assert.deepEqual([hcCalls, statuses.at(-1)], [[["get", "t9"], ["label", "t9", "remote_pi="]], undefined]);
     delete globalThis[Symbol.for("remote-pi.enabled")];
   }
+  {
+    // Rex: block label remote-pi turns remote control on; off renames it to pi.
+    const handlers = new Map(), commands = new Map(), rexCalls = [], statuses = [];
+    const fakePi = { on: (type, handler) => handlers.set(type, handler), registerCommand: (name, command) => commands.set(name, command),
+      registerTool: () => {}, getActiveTools: () => [], setActiveTools: () => {} };
+    const rexCtx = { mode: "tui", ui: { setStatus: (_key, text) => statuses.push(text), notify: () => {} } };
+    createRemoteBridge(fakePi, { env: { REX_SESSION: "session:s1", REX_BLOCK: "block:b1", REMOTE_PI_CONFIG: join(dir, "config.json") }, connect: () => new net.Socket(),
+      rex: async (args) => { rexCalls.push(args); return JSON.stringify({ block: { label: "remote-pi" } }); } });
+    await handlers.get("session_start")({ type: "session_start" }, rexCtx);
+    assert.equal(statuses.at(-1), "📱 reconnecting…");
+    await commands.get("remote-control").handler("off", rexCtx);
+    assert.deepEqual([rexCalls, statuses.at(-1)], [[["block", "inspect", "block:b1", "--json", "--autostart=false"], ["block", "rename", "block:b1", "pi", "--autostart=false"]], undefined]);
+    delete globalThis[Symbol.for("remote-pi.enabled")];
+  }
   let gateway = new Gateway(config);
   const outputs = [];
   const events = [];
@@ -555,6 +569,120 @@ async function selfTest() {
       assert.deepEqual(calls, ["quit", ["hc", "get", "t5"], ["hc", "kill", "t5"], ["hc", "rm", "t5"]]);
     }
 
+    activeTest = "Spawn order: hc -> rex -> herdr workspace.create; failover works and earlier hosts short-circuit.";
+    for (const scenario of ["hc", "rex", "herdr", "none"]) {
+      const { gw, s } = await fresh(), cliCalls = [], herdrCalls = [];
+      gw.bridge.server = {};
+      gw.bridge.start = async () => {};
+      s.pi.bind = () => {};
+      gw.herdrSocketPath = "/fake/socket";
+      const c = { socket: {}, clients: new Set(), hello: { paneId: "placeholder" } };
+      gw.bridge.waitFor = async (predicate) => {
+        predicate(c);
+        return c;
+      };
+      gw.cli = async (command, ...args) => {
+        cliCalls.push([command, ...args]);
+        if (command === "git") return s.cwd;
+        if (command === "herdr-app") return JSON.stringify({ spaces: [] });
+        if (command === "hc") {
+          if (scenario === "hc") {
+            if (args[0] === "run") {
+              c.hello.paneId = "hc:t1";
+              return JSON.stringify({ address: "t1" });
+            }
+            return JSON.stringify({ spaces: [] });
+          }
+          throw new Error("hc unavailable");
+        }
+        if (command === "rex") {
+          if (scenario === "rex") {
+            if (args[0] === "ls") return JSON.stringify({ sessions: [] });
+            if (args[0] === "new") {
+              c.hello.paneId = "rex:block:b1";
+              return JSON.stringify({ initial_windows: [{ block_ids: ["block:b1"] }] });
+            }
+            if (args[0] === "block" && args[1] === "rename") return "";
+          }
+          throw new Error("rex unavailable");
+        }
+        throw new Error(`unexpected command ${command}`);
+      };
+      gw.herdr = async (method, params) => {
+        herdrCalls.push({ method, params });
+        if (scenario === "herdr") {
+          if (method === "workspace.create") {
+            c.hello.paneId = "h1";
+            return { root_pane: { pane_id: "h1", terminal_id: "term1" } };
+          }
+          if (method === "pane.process_info") return { process_info: { shell_pid: 1, foreground_process_group_id: 1 } };
+          return {};
+        }
+        throw new Error("herdr unavailable");
+      };
+      if (scenario === "none") {
+        await assert.rejects(() => gw.startPaneSession(s.pi), /No supported host available: start Herdr desktop \(hc\), Rex, or Herdr TUI/);
+      } else {
+        assert.equal(await gw.startPaneSession(s.pi), true);
+        if (scenario === "hc") {
+          assert.equal(s.binding.paneId, "hc:t1");
+          assert.equal(cliCalls.some(([cmd]) => cmd === "rex"), false);
+          assert.equal(herdrCalls.length, 0);
+        } else if (scenario === "rex") {
+          assert.equal(s.binding.paneId, "rex:block:b1");
+          assert.equal(cliCalls.some(([cmd, sub]) => cmd === "rex" && sub === "new"), true);
+          assert.equal(herdrCalls.length, 0);
+        } else if (scenario === "herdr") {
+          assert.equal(s.binding.paneId, "h1");
+          assert.equal(herdrCalls.some((c) => c.method === "workspace.create"), true);
+        }
+      }
+    }
+    {
+      // Terminal created but hello timed out: never fall through to Rex or Herdr (prevents multiple writers).
+      const { gw, s } = await fresh(), cliCalls = [], herdrCalls = [];
+      gw.bridge.server = {};
+      gw.bridge.start = async () => {};
+      s.pi.bind = () => {};
+      gw.herdrSocketPath = "/fake/socket";
+      gw.bridge.waitFor = async () => { throw new Error("Timed out waiting for Pi bridge hello"); };
+      gw.cli = async (command, ...args) => {
+        cliCalls.push([command, ...args]);
+        if (command === "git") return s.cwd;
+        if (command === "herdr-app") return JSON.stringify({ spaces: [] });
+        if (command === "hc" && args[0] === "run") return JSON.stringify({ address: "t1" });
+        throw new Error(`unexpected command ${command}`);
+      };
+      gw.herdr = async (method, params) => { herdrCalls.push({ method, params }); };
+      await assert.rejects(() => gw.startPaneSession(s.pi), /Timed out waiting for Pi bridge hello/);
+      assert.equal(s.binding.paneId, "hc:t1");
+      assert.equal(cliCalls.some(([cmd]) => cmd === "rex"), false);
+      assert.equal(herdrCalls.length, 0);
+    }
+
+    activeTest = "Rex owned/close: labelled+alive -> rex block close; relabelled -> not closed.";
+    for (const labelled of [true, false]) {
+      const { gw, s } = await fresh(), cliCalls = [];
+      s.binding = { cwd: s.cwd, paneId: "rex:block:b1", terminalId: "b1", owned: true };
+      s.pi.proc = {};
+      s.pi.request = async () => {};
+      gw.cli = async (command, ...args) => {
+        cliCalls.push([command, ...args]);
+        if (args[0] === "block" && args[1] === "inspect") return JSON.stringify({ block: { label: labelled ? "remote-pi" : "pi" } });
+        return "";
+      };
+      await gw.closePaneSession(s);
+      const closed = cliCalls.some(([cmd, sub, act, id]) => cmd === "rex" && sub === "block" && act === "close" && id === "block:b1");
+      assert.equal(closed, labelled, labelled ? "labelled block must be closed" : "relabelled block must not be closed");
+    }
+
+    activeTest = "Startup with herdr status server failure leaves herdrSocketPath null without throwing.";
+    {
+      const { gw } = await fresh();
+      await assert.doesNotReject(() => gw.initHerdr(async () => { throw new Error("connection refused"); }));
+      assert.equal(gw.herdrSocketPath, null);
+    }
+
     activeTest = "HTML format checks (markdown-it renderer)";
     // ref: https://nodejs.org/api/assert.html — share the equality assertion across rendering fixtures.
     for (const [input, expected] of [
@@ -842,8 +970,10 @@ async function selfTest() {
       await gw.sendPaneKeys("rex:block:b1", "esc");
       await gw.sendPaneKeys("rex:block:b1", "enter");
       await gw.paneScreen("rex:block:b1");
-      assert.deepEqual(cliCalls, [["rex", "block", "call", "-b", "block:b1", "program_status"], ["rex", "send-key", "-b", "block:b1", "escape"],
-        ["rex", "send-key", "-b", "block:b1", "enter"], ["rex", "capture", "-b", "block:b1", "--trim"]]);
+      assert.deepEqual(cliCalls, [["rex", "block", "call", "-b", "block:b1", "program_status", "--autostart=false"],
+        ["rex", "send-key", "-b", "block:b1", "escape", "--autostart=false"],
+        ["rex", "send-key", "-b", "block:b1", "enter", "--autostart=false"],
+        ["rex", "capture", "-b", "block:b1", "--trim", "--autostart=false"]]);
     }
     activeTest = "Native command aliases, ambiguity, reserved names, and topic-local discovery.";
     {

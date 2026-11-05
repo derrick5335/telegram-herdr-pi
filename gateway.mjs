@@ -280,7 +280,7 @@ class Telegram {
         }
         status = res.status;
         retryAfter = data.parameters?.retry_after;
-        throw new Error(`Telegram ${method}: ${data.description || status}`);
+        throw Object.assign(new Error(`Telegram ${method}: ${data.description || status}`), { status });
       } catch (error) {
         if (signal?.aborted) throw error;
         if (!quiet) log("tg:call", `${method} attempt ${attempt}/${maxAttempts} failed:`, error.message);
@@ -341,6 +341,28 @@ class Telegram {
       return await this.call("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction: emoji ? [{ type: "emoji", emoji }] : [] }, 10_000, 1);
     } catch { return null; }
   }
+  // Startup probes wait out network outages instead of crash-looping under launchd KeepAlive; only HTTP 401 (bad token) is fatal.
+  // ref: same jittered pollBackoffMs and log cadence as poll() — first failure and every 10th, with cause.
+  async startupProbes(chatId) {
+    for (let failures = 0;; failures++) {
+      try {
+        const [, me, chatReady] = await Promise.all([
+          this.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {}),
+          this.call("getMe"),
+          this.call("getChat", { chat_id: chatId }).then(() => true, (error) => {
+            if (!error.message.includes("chat not found")) throw error;
+            return false;
+          }),
+        ]);
+        return { me, chatReady };
+      } catch (error) {
+        if (error.status === 401) throw error;
+        const cause = error.cause?.code || error.cause?.message;
+        if (failures % 10 === 0) log("tg:startup", `offline (${failures + 1} failed probes): ${error.message}${cause ? ` (${cause})` : ""}; retrying with backoff`);
+        await sleep(pollBackoffMs(failures + 1));
+      }
+    }
+  }
   stopPolling() {
     this.polling = false;
     this.currentPollAc?.abort("stop");
@@ -400,6 +422,15 @@ class Telegram {
 
 // Panes from Herdr desktop (hc:) and Rex (rex:) are bridge-only; the Herdr socket API cannot address them.
 const isHerdrPane = (paneId) => Boolean(paneId) && !/^(hc|rex):/.test(paneId);
+// Map one `rex events --json` line to a pane status update; only root OSC 7501 records describe the pane's program.
+// ref: https://www.superlogical.com/rex/docs/reference/events (session_event wraps block_event) & /build/program-status.
+function rexEventStatus(msg) {
+  const event = msg.type === "session_event" ? msg.payload?.event : null;
+  const block = event?.type === "block_event" ? event.payload : null, payload = block?.payload;
+  const status = block?.name === "program_status_changed" && !payload?.id ? payload.record?.state
+    : block?.name === "program_status_removed" && payload?.ids?.some((id) => !id) ? "idle" : null;
+  return status && block.block_id ? { paneId: `rex:${block.block_id}`, status } : null;
+}
 const paneHasForegroundShell = (info) => Number.isInteger(info?.shell_pid) && info.shell_pid > 0 && info.foreground_process_group_id === info.shell_pid;
 
 // ref: Pi docs/rpc.md#framing; Node net IPC sockets. The directory is private and the socket is mode 0600.
@@ -1134,19 +1165,13 @@ class Gateway {
     } catch { throw new Error("Herdr is required: install herdr and ensure its server is reachable"); }
     await this.bridge.start();
     // Independent startup probes; getChat only decides whether the private chat already exists.
-    [, this.me, this.chatReady] = await Promise.all([
-      this.telegram.call("deleteWebhook", { drop_pending_updates: false }).catch(() => {}),
-      this.telegram.call("getMe"),
-      this.telegram.call("getChat", { chat_id: this.chatId }).then(() => true, (error) => {
-        if (!error.message.includes("chat not found")) throw error;
-        return false;
-      }),
-    ]);
+    ({ me: this.me, chatReady: this.chatReady } = await this.telegram.startupProbes(this.chatId));
     // Startup attaches only; the first message owns lazy Pi startup.
     const attached = await this.ensurePaneSession(this.mainSession.pi, { spawn: false }).catch(() => false);
     await this.registerBotCommands();
     this.syncBlockedSubscription();
     this.watchHcStatus();
+    this.watchRexStatus();
     for (const connection of this.bridge.connections.values()) await this.onPaneHello(connection);
     this.cleanupDownloads();
     this.downloadCleanupTimer = setInterval(() => this.cleanupDownloads(), 24 * 60 * 60_000).unref();
@@ -1342,8 +1367,7 @@ class Gateway {
     for (const session of sessions) {
       if (!session.isStreaming || session.uiMessages?.size) continue;
       const connection = session.pi.connection;
-      screen ??= isHerdrPane(paneId) ? (await this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }))?.read?.text ?? ""
-        : await this.cli("hc", "read", paneId.slice(3));
+      screen ??= await this.paneScreen(paneId);
       if (this.blockedStatuses.get(paneId) !== "blocked" || session.pi.connection !== connection || !session.pi.proc ||
         session.binding.paneId !== paneId || session.uiMessages?.size || !this.sessions.has(session.key)) continue;
       const group = randomBytes(6).toString("hex");
@@ -1354,6 +1378,22 @@ class Gateway {
         disable_notification: this.isUserPresent(),
       });
     }
+  }
+  // Rex block ids are globally unique, so `rex` targets them without -s; the root OSC 7501 record is the pane status.
+  paneStatus(paneId) {
+    if (isHerdrPane(paneId)) return this.herdr("agent.get", { target: paneId }).then((r) => r?.agent?.agent_status);
+    if (paneId.startsWith("rex:")) return this.cli("rex", "block", "call", "-b", paneId.slice(4), "program_status")
+      .then((out) => JSON.parse(out).records?.find((record) => !record.id)?.state);
+    return this.cli("hc", "get", paneId.slice(3)).then(JSON.parse).then((t) => t.status?.state);
+  }
+  sendPaneKeys(paneId, key) {
+    if (isHerdrPane(paneId)) return this.herdr("agent.send_keys", { target: paneId, keys: [key] });
+    if (paneId.startsWith("rex:")) return this.cli("rex", "send-key", "-b", paneId.slice(4), key === "esc" ? "escape" : key);
+    return this.cli("hc", "keys", paneId.slice(3), key);
+  }
+  paneScreen(paneId) {
+    if (isHerdrPane(paneId)) return this.herdr("agent.read", { target: paneId, source: "visible", lines: 40 }).then((r) => r?.read?.text ?? "");
+    return this.cli(...(paneId.startsWith("rex:") ? ["rex", "capture", "-b", paneId.slice(4), "--trim"] : ["hc", "read", paneId.slice(3)]));
   }
   // Herdr desktop panes: hc's event stream is a snapshot, then fact changes; status records carry blocked state.
   // ref: `hc schema` events.subscribe (herdr-core). Unknown terminals are ignored by onAgentStatus.
@@ -1367,6 +1407,19 @@ class Gateway {
     }, false);
     child.on("error", () => {}); // hc missing: retry quietly; close follows.
     child.on("close", () => { if (!this.stopping) setTimeout(() => this.watchHcStatus(retries + 1), reconnectDelayMs(retries)).unref(); });
+  }
+  // Rex panes: one long-lived event stream; prompts only fire for turns started after it connects (no snapshot needed).
+  // ref: https://www.superlogical.com/rex/docs/reference/events — `rex events --all --json` wraps terminal events.
+  watchRexStatus(retries = 0) {
+    if (this.stopping) return;
+    const child = this.rexEvents = spawn("rex", ["events", "--all", "--json", "--autostart=false"], { stdio: ["ignore", "pipe", "ignore"] });
+    let chain = Promise.resolve();
+    readJsonLines(child.stdout, (msg) => {
+      const update = rexEventStatus(msg);
+      if (update) chain = chain.then(() => this.onAgentStatus(update.paneId, update.status)).catch((e) => log("blocked", e.message));
+    }, false);
+    child.on("error", () => {}); // rex missing: retry quietly; close follows.
+    child.on("close", () => { if (!this.stopping) setTimeout(() => this.watchRexStatus(retries + 1), reconnectDelayMs(retries)).unref(); });
   }
   syncBlockedSubscription(connect = net.createConnection) {
     if (this.stopping || HERDR_DISABLED_FOR_TEST && connect === net.createConnection || !this.herdrSocketPath) return;
@@ -1475,10 +1528,9 @@ class Gateway {
         case "herdr_keys": {
           this.dropActions((value) => value.group === action.group);
           const target = this.sessions.get(action.sessionKey);
-          const hcAddress = isHerdrPane(action.paneId) ? null : action.paneId.slice(3);
-          const status = hcAddress ? JSON.parse(await this.cli("hc", "get", hcAddress)).status?.state : (await this.herdr("agent.get", { target: action.paneId }))?.agent?.agent_status;
+          const status = await this.paneStatus(action.paneId);
           if (target?.pi.proc && target.binding.paneId === action.paneId && target.pi.connection?.hello.paneId === action.paneId && !target.uiMessages?.size && status === "blocked") {
-            await (hcAddress ? this.cli("hc", "keys", hcAddress, action.key) : this.herdr("agent.send_keys", { target: action.paneId, keys: [action.key] }));
+            await this.sendPaneKeys(action.paneId, action.key);
           } else await (target || session).send("⚠️ Pi is no longer waiting; nothing sent.", { disable_notification: true });
           if (callback?.message) await this.telegram.clearKeyboard(callback.message.chat.id, callback.message.message_id);
           return;
@@ -1543,6 +1595,7 @@ class Gateway {
     this.herdrSubSocket?.destroy();
     this.herdrSubSocket = null;
     this.hcEvents?.kill();
+    this.rexEvents?.kill();
     this.bridge?.stop().catch((error) => log("bridge", `stop: ${error.message}`));
     try { this.lockServer?.close(); } catch {}
     this.lockServer = null;
@@ -1576,6 +1629,6 @@ if (import.meta.main) main().catch((error) => {
 export {
   BOT_COMMANDS, ChatSession, Gateway, HELP, MAX_MESSAGE, PaneRpc, Telegram,
   chunks, expandableBlockquote, formatAssistantError, loadConfig, loadState,
-  paneHasForegroundShell, parseCommand, pollBackoffMs, sessionKeyOf, setTestMode,
+  paneHasForegroundShell, parseCommand, pollBackoffMs, rexEventStatus, sessionKeyOf, setTestMode,
   shouldRetryTelegram, telegramCommandName, telegramHtml,
 };

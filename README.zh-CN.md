@@ -108,7 +108,7 @@ Linux 上请手动创建配置（见[配置](#配置)），用 `ln -sfn "$PWD/re
 
 这个会话会得到一个专属的 `📡` Topic，并附上最近一问一答作为预览；Pi 底栏显示 `📱 remote`。这个开关在 `/reload` 和切换会话后依然保留。`/remote-control off`，或在 Topic 里执行 `/close`，都只会断开 Telegram，你的 Pi 会继续运行。
 
-Herdr 服务端未运行但 Herdr 桌面版在运行时，从 Telegram 启动的 Pi 会经 `hc run` 作为新标签页打开在同一项目的 space 中，与桌面端会话一致：选择首个终端位于同一 git 仓库（否则同一文件夹）的 space，没有则新建一个由 Herdr 按项目自动命名的 space；终端标签 `remote_pi=on` 让扩展启动即开启远程控制，`/close` 会退出 Pi 并移除其标签页，blocked 提示由 `hc events` 推送。你自己在 Herdr 桌面版或 Rex 中接入的 Pi 仍只支持附加：断开后 Topic 会提示你重新执行 `/remote-control on`，而不会再启动第二个 Pi。
+Herdr 服务端未运行但 Herdr 桌面版在运行时，从 Telegram 启动的 Pi 会经 `hc run` 作为新标签页打开在同一项目的 space 中，与桌面端会话一致：选择首个终端位于同一 git 仓库（否则同一文件夹）的 space，没有则新建一个由 Herdr 按项目自动命名的 space；终端标签 `remote_pi=on` 让扩展启动即开启远程控制，`/close` 会退出 Pi 并移除其标签页，blocked 提示由 `hc events` 推送（Rex 窗格改由常驻的 `rex events` 流推送）。你自己在 Herdr 桌面版或 Rex 中接入的 Pi 仍只支持附加：断开后 Topic 会提示你重新执行 `/remote-control on`，而不会再启动第二个 Pi。
 
 ### 在手机上
 
@@ -188,9 +188,9 @@ Herdr 服务端未运行但 Herdr 桌面版在运行时，从 Telegram 启动的
 
 ## 工作原理
 
-- `gateway.mjs` 长轮询 Telegram，把 Markdown 渲染成 Telegram HTML，并通过私有 Unix socket（`bridge.sock`，权限 600）以 JSON lines 和每个 Pi 通信。输出先以 `sendMessageDraft` 预览流式展示，最后用普通的 `sendMessage` 发出。
+- `gateway.mjs` 长轮询 Telegram，把 Markdown 渲染成 Telegram HTML，并通过私有 Unix socket（`bridge.sock`，权限 600）以 JSON lines 和每个 Pi 通信。输出先以 `sendMessageDraft` 预览流式展示，最后用普通的 `sendMessage` 发出。启动时的 Telegram 探测在网络离线期间按轮询同款抖动退避无限重试，不会被 launchd KeepAlive 反复重启；仅 token 无效（HTTP 401）立即退出。
 - `remote-pi.ts` 是基于 Pi 1.3.0 公开 API 的 Pi 扩展。它转发 Pi 的事件，执行网关的请求（提示、模型、压缩、新建/切换会话……），提供 `/remote-control`、`remote_attach` 和 `remote_ask`，并会自动重连。它根据环境变量识别宿主（Herdr：`HERDR_ENV`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`；Herdr 桌面版：`HC_TERMINAL_ID`/`HC_SCOPE`；Rex：`REX_SESSION`/`REX_BLOCK`）。在 Herdr 中开关状态保存在窗格元数据里（`remote_pi=on`），其他宿主则保存在 Pi 进程内；在 Herdr 桌面版中，网关设置的终端标签 `remote_pi=on` 会在启动时开启它（`/remote-control off` 会清除该标签）。
-- 进程归 Herdr 管：网关通过 Herdr 的 socket API 创建 workspace、启动 Pi（`agent.start`）、读取屏幕；用窗格元数据打开扩展的远程开关，而不是往 shell 里敲命令；blocked 状态变化由 `events.subscribe` 主动推送；并按 Herdr 的 `terminal_id` 绑定会话。唯一的 Herdr CLI 调用是启动时用 `herdr status server --json` 查找 socket。没有 Herdr 服务端时，网关改用 Herdr 桌面版 CLI：`herdr-app ls` 加 `git rev-parse --show-toplevel` 选择项目所在的 space，`hc run`/`get`/`read`/`keys`/`kill`/`rm`，以及常驻的 `hc events` 获取 blocked 状态。
+- 进程归 Herdr 管：网关通过 Herdr 的 socket API 创建 workspace、启动 Pi（`agent.start`）、读取屏幕；用窗格元数据打开扩展的远程开关，而不是往 shell 里敲命令；blocked 状态变化由 `events.subscribe` 主动推送；并按 Herdr 的 `terminal_id` 绑定会话。唯一的 Herdr CLI 调用是启动时用 `herdr status server --json` 查找 socket。没有 Herdr 服务端时，网关改用 Herdr 桌面版 CLI：`herdr-app ls` 加 `git rev-parse --show-toplevel` 选择项目所在的 space，`hc run`/`get`/`read`/`keys`/`kill`/`rm`，以及常驻的 `hc events` 获取 blocked 状态。Rex 窗格的 blocked 提示镜像同一套流程：常驻的 `rex events --all --json` 子进程把 OSC 7501 根记录映射为 blocked 状态，屏幕预览用 `rex capture`，Enter/Esc 用 `rex send-key`。
 - 会话归 Pi 管：会话文件留在 Pi 原生的会话目录里；`state.json` 只记录哪个 Topic 在看哪个窗格和会话。
 - Pi 1.3.0 公开 API 的已知限制：没有原生的队列查看/清空接口，也没有自动重试事件。
 

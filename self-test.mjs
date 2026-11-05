@@ -12,7 +12,7 @@ import { createRemoteBridge, detectHost } from "./remote-pi.ts";
 import {
   BOT_COMMANDS, ChatSession, Gateway, HELP, MAX_MESSAGE, PaneRpc, Telegram,
   chunks, expandableBlockquote, formatAssistantError, loadConfig, loadState, paneHasForegroundShell, parseCommand,
-  pollBackoffMs, sessionKeyOf, setTestMode, shouldRetryTelegram, telegramCommandName, telegramHtml,
+  pollBackoffMs, rexEventStatus, sessionKeyOf, setTestMode, shouldRetryTelegram, telegramCommandName, telegramHtml,
 } from "./gateway.mjs";
 
 const LINE_BUDGET = 2000;
@@ -820,6 +820,31 @@ async function selfTest() {
       await sleep(300);
       assert.equal(sockets.length, 3, "shutdown cancels reconnection");
     }
+    activeTest = "Rex blocked mapping: root OSC 7501 records drive pane status; keys and screen go through rex.";
+    {
+      const { gw } = await fresh();
+      const line = (payload) => ({ type: "session_event", payload: { session_id: "session:x", event: { type: "block_event", payload } } });
+      assert.deepEqual(rexEventStatus(line({ block_id: "block:b1", creator_name: "com.superlogical.terminal", name: "program_status_changed",
+        payload: { id: "", record: { state: "blocked", kind: "question", msg: "probe", updated_at: "2026-11-05T07:40:11.125973+08:00" }, reason: "report" } })),
+        { paneId: "rex:block:b1", status: "blocked" });
+      assert.deepEqual(rexEventStatus(line({ block_id: "block:b1", name: "program_status_removed", payload: { ids: ["", "worker"], reason: "prompt" } })),
+        { paneId: "rex:block:b1", status: "idle" });
+      assert.equal(rexEventStatus(line({ block_id: "block:b1", name: "program_status_changed", payload: { id: "worker", record: { state: "blocked" } } })),
+        null, "child records never drive the pane status");
+      assert.equal(rexEventStatus(line({ block_id: "block:b1", name: "bell", payload: {} })), null);
+      assert.equal(rexEventStatus({ type: "client_joined", payload: {} }), null);
+      const cliCalls = [];
+      gw.cli = async (...args) => {
+        cliCalls.push(args);
+        return JSON.stringify({ records: [{ state: "blocked" }] });
+      };
+      assert.equal(await gw.paneStatus("rex:block:b1"), "blocked");
+      await gw.sendPaneKeys("rex:block:b1", "esc");
+      await gw.sendPaneKeys("rex:block:b1", "enter");
+      await gw.paneScreen("rex:block:b1");
+      assert.deepEqual(cliCalls, [["rex", "block", "call", "-b", "block:b1", "program_status"], ["rex", "send-key", "-b", "block:b1", "escape"],
+        ["rex", "send-key", "-b", "block:b1", "enter"], ["rex", "capture", "-b", "block:b1", "--trim"]]);
+    }
     activeTest = "Native command aliases, ambiguity, reserved names, and topic-local discovery.";
     {
       const { gw, s, calls } = await fresh(), prompts = [], sent = [];
@@ -936,6 +961,29 @@ async function selfTest() {
         assert.ok(Date.now() - started >= 45 && Date.now() - started < 900, "use retry_after, not the default 1s delay");
       } finally { globalThis.fetch = guardedFetch; }
       assert.deepEqual([pollBackoffMs(1, () => 0), pollBackoffMs(2, () => 1), pollBackoffMs(10, () => 1)], [500, 2000, 60_000]);
+    }
+
+    activeTest = "Startup probes wait out network outages; an unauthorized token fails fast without a retry loop.";
+    {
+      const guardedFetch = globalThis.fetch, tg = new Telegram("1:x", "unused"), seen = [];
+      const respond = (result) => ({ ok: true, status: 200, json: async () => ({ ok: true, result }) });
+      try {
+        let failures = 4;
+        globalThis.fetch = async (url) => {
+          seen.push(url);
+          if (url.endsWith("/getMe") && failures-- > 0) throw new Error("fetch failed");
+          return respond(url.endsWith("/getMe") ? { username: "bot" } : true);
+        };
+        assert.deepEqual(await tg.startupProbes("1"), { me: { username: "bot" }, chatReady: true }, "probes proceed once the network returns");
+        assert.equal(seen.filter((url) => url.endsWith("/getMe")).length, 5, "internal retries plus the startup loop absorb the fetch failures");
+        seen.length = 0;
+        globalThis.fetch = async (url) => {
+          seen.push(url);
+          return { ok: false, status: 401, json: async () => ({ ok: false, description: "Unauthorized" }) };
+        };
+        await assert.rejects(() => tg.startupProbes("1"), (error) => error.status === 401);
+        assert.equal(seen.length, 3, "401 is unrecoverable: one probe round each, no retry loop");
+      } finally { globalThis.fetch = guardedFetch; }
     }
 
     activeTest = "Conflict waits are abortable, distinct from network-outage backoff.";
